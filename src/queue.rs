@@ -40,8 +40,10 @@ pub enum JobState {
 pub enum Command {
     Probe(std::path::PathBuf),
     Preview {
+        id: u64,
         path: std::path::PathBuf,
         at_secs: f64,
+        fast_seek: bool,
     },
     BatchFiles {
         paths: Vec<PathBuf>,
@@ -63,8 +65,12 @@ pub enum Command {
 pub enum Event {
     ProbeStarted,
     ProbeFinished(Result<MediaInfo, String>),
-    PreviewStarted(f64),
+    PreviewStarted {
+        id: u64,
+        at_secs: f64,
+    },
     PreviewFinished {
+        id: u64,
         at_secs: f64,
         result: Result<PreviewFrame, String>,
     },
@@ -150,6 +156,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
     }
     let mut processing = false;
     let mut active: Option<ActiveJob> = None;
+    let mut preview_cancel: Option<Arc<AtomicBool>> = None;
     loop {
         if let Some((id, cancelled, result_rx)) = &active {
             if let Ok((finished_id, result)) = result_rx.try_recv() {
@@ -189,12 +196,30 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 let result = engine.probe(&path).map_err(|error| error.to_string());
                 let _ = events.send(Event::ProbeFinished(result));
             }
-            Command::Preview { path, at_secs } => {
-                let _ = events.send(Event::PreviewStarted(at_secs));
-                let result = engine
-                    .preview(&path, at_secs, 640)
-                    .map_err(|error| error.to_string());
-                let _ = events.send(Event::PreviewFinished { at_secs, result });
+            Command::Preview {
+                id,
+                path,
+                at_secs,
+                fast_seek,
+            } => {
+                if let Some(cancelled) = preview_cancel.take() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                let cancelled = Arc::new(AtomicBool::new(false));
+                preview_cancel = Some(cancelled.clone());
+                let preview_engine = engine.clone();
+                let preview_events = events.clone();
+                let _ = events.send(Event::PreviewStarted { id, at_secs });
+                thread::spawn(move || {
+                    let result = preview_engine
+                        .preview(&path, at_secs, 640, fast_seek, cancelled)
+                        .map_err(|error| error.to_string());
+                    let _ = preview_events.send(Event::PreviewFinished {
+                        id,
+                        at_secs,
+                        result,
+                    });
+                });
             }
             Command::BatchFiles { paths, settings } => {
                 import_paths(&engine, paths, &settings, &mut jobs, &mut next_id, &events);
@@ -239,6 +264,9 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 persist_jobs(&jobs, &events);
             }
             Command::Shutdown => {
+                if let Some(cancelled) = &preview_cancel {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
                 if let Some((_, cancelled, _)) = &active {
                     cancelled.store(true, Ordering::Relaxed);
                 }

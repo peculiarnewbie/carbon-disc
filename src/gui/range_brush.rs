@@ -3,7 +3,8 @@ use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Response, Sense, Strok
 use super::theme;
 
 const MIN_RANGE_SECS: f64 = 0.1;
-const HANDLE_HIT_RADIUS: f32 = 12.0;
+const HANDLE_HIT_RADIUS: f32 = 15.0;
+const HANDLE_HALF_HEIGHT: f32 = 20.0;
 
 #[derive(Clone, Copy)]
 enum DragPart {
@@ -151,10 +152,12 @@ pub fn show(
 fn hit_test(pointer: Pos2, start_x: f32, end_x: f32, track: Rect) -> DragPart {
     // The white preview marker may share an x position with a trim handle. Its circle is
     // in the upper lane, while the violet handles occupy the lower lane.
-    let in_handle_lane = pointer.y >= track.center().y - 14.0;
-    if in_handle_lane && (pointer.x - start_x).abs() <= HANDLE_HIT_RADIUS {
+    let in_handle_lane = pointer.y >= track.center().y - HANDLE_HALF_HEIGHT;
+    let start_distance = (pointer.x - start_x).abs();
+    let end_distance = (pointer.x - end_x).abs();
+    if in_handle_lane && start_distance <= HANDLE_HIT_RADIUS && start_distance <= end_distance {
         DragPart::Start
-    } else if in_handle_lane && (pointer.x - end_x).abs() <= HANDLE_HIT_RADIUS {
+    } else if in_handle_lane && end_distance <= HANDLE_HIT_RADIUS {
         DragPart::End
     } else {
         DragPart::Playhead
@@ -176,7 +179,7 @@ fn x_to_time(x: f32, duration: f64, track: Rect) -> f64 {
 }
 
 fn paint_handle(painter: &egui::Painter, x: f32, center_y: f32, active: bool) {
-    let handle = Rect::from_center_size(Pos2::new(x, center_y), Vec2::new(8.0, 28.0));
+    let handle = Rect::from_center_size(Pos2::new(x, center_y), Vec2::new(12.0, 36.0));
     let color = if active {
         theme::VIOLET
     } else {
@@ -201,8 +204,12 @@ mod tests {
             DragPart::Playhead
         ));
         assert!(matches!(
-            hit_test(Pos2::new(10.0, 34.0), 10.0, 290.0, track),
+            hit_test(Pos2::new(10.0, 16.0), 10.0, 290.0, track),
             DragPart::Start
+        ));
+        assert!(matches!(
+            hit_test(Pos2::new(290.0, 16.0), 10.0, 290.0, track),
+            DragPart::End
         ));
     }
 

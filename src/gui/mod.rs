@@ -33,6 +33,9 @@ pub struct App {
     preview_loading: bool,
     preview_error: Option<String>,
     preview_due: Option<Instant>,
+    preview_fast_seek: bool,
+    next_preview_id: u64,
+    active_preview_id: Option<u64>,
     selected_audio_tracks: BTreeSet<u32>,
     pending_overwrite: Option<EncodeRequest>,
     request_error: Option<String>,
@@ -80,6 +83,9 @@ impl App {
             preview_loading: false,
             preview_error: None,
             preview_due: None,
+            preview_fast_seek: false,
+            next_preview_id: 1,
+            active_preview_id: None,
             selected_audio_tracks: BTreeSet::new(),
             pending_overwrite: None,
             request_error,
@@ -103,6 +109,9 @@ impl App {
                 Event::ProbeStarted => {
                     self.probing = true;
                     self.probe_error = None;
+                    self.next_preview_id += 1;
+                    self.active_preview_id = None;
+                    self.preview_loading = false;
                     self.preview_texture = None;
                     self.preview_error = None;
                     self.preview_due = None;
@@ -118,6 +127,7 @@ impl App {
                             self.trim_start_secs = 0.0;
                             self.trim_end_secs = media.duration_secs;
                             self.preview_at_secs = 0.0;
+                            self.preview_fast_seek = false;
                             self.preview_due = Some(Instant::now());
                             self.output = suggested_output(&media.path, self.settings.container)
                                 .display()
@@ -127,14 +137,26 @@ impl App {
                         Err(error) => self.probe_error = Some(error),
                     }
                 }
-                Event::PreviewStarted(at_secs) => {
-                    if (at_secs - self.preview_at_secs).abs() < 0.051 {
+                Event::PreviewStarted { id, at_secs } => {
+                    if self.active_preview_id == Some(id)
+                        && (at_secs - self.preview_at_secs).abs() < 0.051
+                    {
                         self.preview_loading = true;
                     }
                 }
-                Event::PreviewFinished { at_secs, result } => {
-                    self.preview_loading = false;
-                    if (at_secs - self.preview_at_secs).abs() < 0.051 {
+                Event::PreviewFinished {
+                    id,
+                    at_secs,
+                    result,
+                } => {
+                    if self.active_preview_id == Some(id) {
+                        self.preview_loading = false;
+                        self.active_preview_id = None;
+                    }
+                    if self.active_preview_id.is_none()
+                        && id + 1 == self.next_preview_id
+                        && (at_secs - self.preview_at_secs).abs() < 0.051
+                    {
                         match result {
                             Ok(frame) => {
                                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -264,20 +286,27 @@ impl App {
         }
     }
 
-    fn schedule_preview(&mut self) {
-        self.preview_due = Some(Instant::now() + Duration::from_millis(180));
+    fn schedule_preview(&mut self, fast_seek: bool) {
+        self.preview_fast_seek = fast_seek;
+        let delay = if fast_seek { 35 } else { 80 };
+        self.preview_due = Some(Instant::now() + Duration::from_millis(delay));
     }
 
     fn dispatch_preview_if_due(&mut self) {
-        if self.preview_loading || self.preview_due.is_none_or(|due| due > Instant::now()) {
+        if self.preview_due.is_none_or(|due| due > Instant::now()) {
             return;
         }
         self.preview_due = None;
         if let Some(media) = &self.media {
+            let id = self.next_preview_id;
+            self.next_preview_id += 1;
+            self.active_preview_id = Some(id);
             self.preview_loading = true;
             self.coordinator.send(Command::Preview {
+                id,
                 path: media.path.clone(),
                 at_secs: self.preview_at_secs,
+                fast_seek: self.preview_fast_seek,
             });
         }
     }
@@ -610,7 +639,7 @@ impl App {
                                     self.trim_start_secs = 0.0;
                                     self.trim_end_secs = source_duration;
                                     self.preview_at_secs = 0.0;
-                                    self.schedule_preview();
+                                    self.schedule_preview(false);
                                 }
                             },
                         );
@@ -667,7 +696,10 @@ impl App {
                         source_duration,
                     );
                     if brush_response.changed() {
-                        self.schedule_preview();
+                        self.schedule_preview(brush_response.dragged());
+                    }
+                    if brush_response.drag_stopped() {
+                        self.schedule_preview(false);
                     }
                     let mut precise_preview = None;
                     egui::Grid::new("encode_range")
@@ -703,7 +735,7 @@ impl App {
                     if let Some(at_secs) = precise_preview {
                         self.preview_at_secs =
                             at_secs.min((source_duration - 0.1).max(0.0));
-                        self.schedule_preview();
+                        self.schedule_preview(false);
                     }
                     ui.label(
                         RichText::new(

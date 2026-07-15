@@ -23,7 +23,14 @@ pub trait MediaEngine: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> Result<EngineCapabilities>;
     fn probe(&self, path: &Path) -> Result<MediaInfo>;
-    fn preview(&self, path: &Path, at_secs: f64, max_width: u32) -> Result<PreviewFrame>;
+    fn preview(
+        &self,
+        path: &Path,
+        at_secs: f64,
+        max_width: u32,
+        fast_seek: bool,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<PreviewFrame>;
     fn encode(
         &self,
         request: &EncodeRequest,

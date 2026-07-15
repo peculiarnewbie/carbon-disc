@@ -224,27 +224,39 @@ impl FfmpegEngine {
     }
 
     #[must_use]
-    pub fn preview_args(path: &Path, at_secs: f64, max_width: u32) -> Vec<OsString> {
-        vec![
+    pub fn preview_args(
+        path: &Path,
+        at_secs: f64,
+        max_width: u32,
+        fast_seek: bool,
+    ) -> Vec<OsString> {
+        let mut args = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
             "error".into(),
             "-ss".into(),
             format!("{at_secs:.3}").into(),
-            "-i".into(),
+        ];
+        if fast_seek {
+            args.push("-noaccurate_seek".into());
+        }
+        args.extend([
+            OsString::from("-i"),
             path.as_os_str().into(),
-            "-frames:v".into(),
-            "1".into(),
-            "-an".into(),
-            "-sn".into(),
-            "-vf".into(),
+            OsString::from("-frames:v"),
+            OsString::from("1"),
+            OsString::from("-an"),
+            OsString::from("-sn"),
+            OsString::from("-dn"),
+            OsString::from("-vf"),
             format!("scale={}:-2", max_width.max(16)).into(),
-            "-f".into(),
-            "image2pipe".into(),
-            "-vcodec".into(),
-            "png".into(),
-            "pipe:1".into(),
-        ]
+            OsString::from("-f"),
+            OsString::from("image2pipe"),
+            OsString::from("-vcodec"),
+            OsString::from("ppm"),
+            OsString::from("pipe:1"),
+        ]);
+        args
     }
 
     fn encoder_initializes(&self, encoder: VideoEncoder) -> bool {
@@ -352,32 +364,71 @@ impl MediaEngine for FfmpegEngine {
         parse_probe(path, &output.stdout)
     }
 
-    fn preview(&self, path: &Path, at_secs: f64, max_width: u32) -> Result<PreviewFrame> {
+    fn preview(
+        &self,
+        path: &Path,
+        at_secs: f64,
+        max_width: u32,
+        fast_seek: bool,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<PreviewFrame> {
         if !at_secs.is_finite() || at_secs < 0.0 {
             return Err(Error::InvalidRequest(
                 "preview position must be a positive time".into(),
             ));
         }
-        let output = Command::new(&self.ffmpeg)
-            .args(Self::preview_args(path, at_secs, max_width))
-            .output()
+        let mut child = Command::new(&self.ffmpeg)
+            .args(Self::preview_args(path, at_secs, max_width, fast_seek))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|source| Error::Launch {
                 program: self.ffmpeg.clone(),
                 source,
             })?;
-        if !output.status.success() {
+        let mut stdout = child.stdout.take().ok_or_else(|| Error::Process {
+            program: self.ffmpeg.display().to_string(),
+            message: "preview output pipe was unavailable".into(),
+        })?;
+        let mut stderr = child.stderr.take().ok_or_else(|| Error::Process {
+            program: self.ffmpeg.display().to_string(),
+            message: "preview diagnostic pipe was unavailable".into(),
+        })?;
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let status = loop {
+            if cancelled.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(Error::Cancelled);
+            }
+            match child.try_wait()? {
+                Some(status) => break status,
+                None => thread::sleep(Duration::from_millis(8)),
+            }
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| Error::InvalidPreview("preview reader stopped unexpectedly".into()))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| Error::InvalidPreview("preview reader stopped unexpectedly".into()))??;
+        if !status.success() {
             return Err(Error::Process {
                 program: self.ffmpeg.display().to_string(),
-                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                message: String::from_utf8_lossy(&stderr).trim().to_owned(),
             });
         }
-        let image = image::load_from_memory(&output.stdout)?.into_rgba8();
-        let (width, height) = image.dimensions();
-        Ok(PreviewFrame {
-            width,
-            height,
-            rgba: image.into_raw(),
-        })
+        parse_ppm(&stdout)
     }
 
     fn encode(
@@ -625,6 +676,83 @@ fn parse_probe(path: &Path, bytes: &[u8]) -> Result<MediaInfo> {
     })
 }
 
+fn parse_ppm(bytes: &[u8]) -> Result<PreviewFrame> {
+    let mut cursor = 0;
+    let magic = ppm_token(bytes, &mut cursor)?;
+    if magic != b"P6" {
+        return Err(Error::InvalidPreview("expected a binary PPM frame".into()));
+    }
+    let width = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "width")?;
+    let height = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "height")?;
+    let maximum = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "color depth")?;
+    if maximum != 255 || width == 0 || height == 0 {
+        return Err(Error::InvalidPreview(
+            "unsupported PPM dimensions or color depth".into(),
+        ));
+    }
+    if bytes.get(cursor) == Some(&b'\r') {
+        cursor += 1;
+        if bytes.get(cursor) == Some(&b'\n') {
+            cursor += 1;
+        }
+    } else if bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    } else {
+        return Err(Error::InvalidPreview("PPM header is incomplete".into()));
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| Error::InvalidPreview("PPM dimensions overflow".into()))?;
+    let rgb_len = pixel_count
+        .checked_mul(3)
+        .ok_or_else(|| Error::InvalidPreview("PPM frame is too large".into()))?;
+    let rgb = bytes
+        .get(cursor..cursor + rgb_len)
+        .ok_or_else(|| Error::InvalidPreview("PPM pixel data is truncated".into()))?;
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    for pixel in rgb.chunks_exact(3) {
+        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    }
+    Ok(PreviewFrame {
+        width,
+        height,
+        rgba,
+    })
+}
+
+fn ppm_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8]> {
+    loop {
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
+            *cursor += 1;
+        }
+        if bytes.get(*cursor) != Some(&b'#') {
+            break;
+        }
+        while bytes.get(*cursor).is_some_and(|byte| *byte != b'\n') {
+            *cursor += 1;
+        }
+    }
+    let start = *cursor;
+    while bytes
+        .get(*cursor)
+        .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        *cursor += 1;
+    }
+    if start == *cursor {
+        Err(Error::InvalidPreview("PPM header is incomplete".into()))
+    } else {
+        Ok(&bytes[start..*cursor])
+    }
+}
+
+fn parse_ppm_number(token: &[u8], name: &str) -> Result<u32> {
+    std::str::from_utf8(token)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| Error::InvalidPreview(format!("invalid PPM {name}")))
+}
+
 fn tag(tags: &Option<HashMap<String, String>>, key: &str) -> Option<String> {
     tags.as_ref()?
         .iter()
@@ -726,11 +854,20 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_a_single_scaled_png_frame() {
-        let args = FfmpegEngine::preview_args(Path::new("source movie.mkv"), 12.3456, 640);
+    fn preview_is_a_single_scaled_ppm_frame() {
+        let args = FfmpegEngine::preview_args(Path::new("source movie.mkv"), 12.3456, 640, true);
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
+        assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
         assert!(args.windows(2).any(|pair| pair == ["-vf", "scale=640:-2"]));
-        assert!(args.windows(2).any(|pair| pair == ["-vcodec", "png"]));
+        assert!(args.windows(2).any(|pair| pair == ["-vcodec", "ppm"]));
+    }
+
+    #[test]
+    fn parses_uncompressed_preview_frame() {
+        let frame = parse_ppm(b"P6\n# generated\n2 1\n255\n\x01\x02\x03\x04\x05\x06")
+            .expect("valid PPM frame");
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(frame.rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
     }
 
     #[test]

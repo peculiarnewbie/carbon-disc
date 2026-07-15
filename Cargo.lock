@@ -621,7 +621,6 @@ dependencies = [
  "clap",
  "directories",
  "eframe",
- "image",
  "rfd",
  "serde",
  "serde_json",
