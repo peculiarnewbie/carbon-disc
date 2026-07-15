@@ -8,4 +8,7 @@ pub mod queue;
 
 pub use engine::{EngineEvent, MediaEngine};
 pub use error::{Error, Result};
-pub use model::{EncodeRange, EncodeRequest, EncodeSettings, MediaInfo, Preset, PreviewFrame};
+pub use model::{
+    AudioTrackSettings, CropMargins, EncodeRange, EncodeRequest, EncodeSettings, MediaInfo, Preset,
+    PreviewFrame,
+};

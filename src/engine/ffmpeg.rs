@@ -49,6 +49,11 @@ impl FfmpegEngine {
 
     #[must_use]
     pub fn encode_args(request: &EncodeRequest) -> Vec<OsString> {
+        Self::encode_args_for_output(request, &request.output)
+    }
+
+    #[must_use]
+    pub fn encode_args_for_output(request: &EncodeRequest, output: &Path) -> Vec<OsString> {
         let settings = &request.settings;
         let video_codec = match settings.video_encoder {
             VideoEncoder::H264 => "libx264",
@@ -78,14 +83,14 @@ impl FfmpegEngine {
                 format!("{:.3}", request.output_duration_secs()).into(),
             ]);
         }
-        args.extend([
-            "-map".into(),
-            "0:v:0".into(),
-            "-map".into(),
-            "0:a?".into(),
-            "-c:v".into(),
-            video_codec.into(),
-        ]);
+        args.extend(["-map".into(), "0:v:0".into()]);
+        for track in &request.audio_tracks {
+            args.extend([
+                OsString::from("-map"),
+                format!("0:{}", track.source_index).into(),
+            ]);
+        }
+        args.extend([OsString::from("-c:v"), video_codec.into()]);
         if settings.video_encoder == VideoEncoder::Vp9 {
             let cpu_used = match settings.speed {
                 EncoderSpeed::Fast => "6",
@@ -110,21 +115,36 @@ impl FfmpegEngine {
                 preset.into(),
             ]);
         }
-        match settings.audio_encoder {
-            AudioEncoder::Copy => args.extend([OsString::from("-c:a"), OsString::from("copy")]),
-            encoder => {
-                let codec = if encoder == AudioEncoder::Aac {
-                    "aac"
-                } else {
-                    "libopus"
-                };
-                args.extend([
-                    OsString::from("-c:a"),
-                    codec.into(),
-                    OsString::from("-b:a"),
-                    format!("{}k", settings.audio_bitrate_kbps).into(),
-                ]);
+        for (output_index, track) in request.audio_tracks.iter().enumerate() {
+            let codec_option = format!("-c:a:{output_index}");
+            match track.encoder {
+                AudioEncoder::Copy => {
+                    args.extend([codec_option.into(), OsString::from("copy")]);
+                }
+                encoder => {
+                    let codec = if encoder == AudioEncoder::Aac {
+                        "aac"
+                    } else {
+                        "libopus"
+                    };
+                    args.extend([
+                        codec_option.into(),
+                        codec.into(),
+                        format!("-b:a:{output_index}").into(),
+                        format!("{}k", track.bitrate_kbps).into(),
+                    ]);
+                }
             }
+        }
+        let mut filters = Vec::new();
+        if !settings.crop.is_zero() {
+            filters.push(format!(
+                "crop=iw-{}:ih-{}:{}:{}",
+                settings.crop.left + settings.crop.right,
+                settings.crop.top + settings.crop.bottom,
+                settings.crop.left,
+                settings.crop.top
+            ));
         }
         if settings.max_width.is_some() || settings.max_height.is_some() {
             let width = settings
@@ -133,7 +153,10 @@ impl FfmpegEngine {
             let height = settings
                 .max_height
                 .map_or_else(|| "ih".into(), |v| v.to_string());
-            args.extend([OsString::from("-vf"), format!("scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2").into()]);
+            filters.push(format!("scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"));
+        }
+        if !filters.is_empty() {
+            args.extend([OsString::from("-vf"), filters.join(",").into()]);
         }
         if request.settings.container == crate::model::Container::Mp4 {
             args.extend([OsString::from("-movflags"), OsString::from("+faststart")]);
@@ -142,7 +165,7 @@ impl FfmpegEngine {
             OsString::from("-progress"),
             OsString::from("pipe:1"),
             OsString::from("-nostats"),
-            request.output.as_os_str().into(),
+            output.as_os_str().into(),
         ]);
         args
     }
@@ -237,8 +260,12 @@ impl MediaEngine for FfmpegEngine {
         emit: &mut dyn FnMut(EngineEvent),
     ) -> Result<()> {
         request.validate()?;
+        if request.output.exists() && !request.overwrite {
+            return Err(Error::OutputExists(request.output.clone()));
+        }
+        let temporary = TemporaryOutput::new(&request.output)?;
         let mut child = Command::new(&self.ffmpeg)
-            .args(Self::encode_args(request))
+            .args(Self::encode_args_for_output(request, temporary.path()))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -296,12 +323,81 @@ impl MediaEngine for FfmpegEngine {
                 message: tail(&stderr, 20),
             });
         }
+        temporary.commit(&request.output, request.overwrite)?;
         emit(EngineEvent::Progress {
             fraction: 1.0,
             frame: None,
             speed: None,
         });
         Ok(())
+    }
+}
+
+struct TemporaryOutput {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TemporaryOutput {
+    fn new(destination: &Path) -> Result<Self> {
+        let stem = destination
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output");
+        let extension = destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let name = if extension.is_empty() {
+            format!(".{stem}.carbon-disc-{}.part", std::process::id())
+        } else {
+            format!(
+                ".{stem}.carbon-disc-{}.part.{extension}",
+                std::process::id()
+            )
+        };
+        let path = destination.with_file_name(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(mut self, destination: &Path, overwrite: bool) -> Result<()> {
+        if !overwrite {
+            match std::fs::hard_link(&self.path, destination) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(Error::OutputExists(destination.to_owned()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            #[cfg(windows)]
+            if destination.exists() {
+                std::fs::remove_file(destination)?;
+            }
+            std::fs::rename(&self.path, destination)?;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -433,7 +529,15 @@ mod tests {
             input: "in file.mkv".into(),
             output: "out.mp4".into(),
             source_duration_secs: 10.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
             range: crate::EncodeRange::ALL,
+            audio_tracks: vec![crate::AudioTrackSettings {
+                source_index: 2,
+                encoder: AudioEncoder::Aac,
+                bitrate_kbps: 192,
+            }],
+            overwrite: false,
             settings: EncodeSettings::default(),
         };
         let args = FfmpegEngine::encode_args(&request);
@@ -447,6 +551,8 @@ mod tests {
                 std::ffi::OsStr::new("libx264"),
             ]));
         assert_eq!(request.settings, Preset::Balanced.settings());
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:2"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a:0", "aac"]));
     }
 
     #[test]
@@ -455,7 +561,11 @@ mod tests {
             input: "in.mkv".into(),
             output: "out.mp4".into(),
             source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
             range: crate::EncodeRange::new(12.5, 42.75),
+            audio_tracks: Vec::new(),
+            overwrite: false,
             settings: EncodeSettings::default(),
         };
         let args = FfmpegEngine::encode_args(&request);
@@ -470,6 +580,86 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
         assert!(args.windows(2).any(|pair| pair == ["-vf", "scale=640:-2"]));
         assert!(args.windows(2).any(|pair| pair == ["-vcodec", "png"]));
+    }
+
+    #[test]
+    fn crop_runs_before_aspect_preserving_scale() {
+        let settings = EncodeSettings {
+            crop: crate::CropMargins {
+                top: 10,
+                bottom: 20,
+                left: 30,
+                right: 40,
+            },
+            max_width: Some(1280),
+            max_height: Some(720),
+            ..EncodeSettings::default()
+        };
+        let request = EncodeRequest {
+            input: "in.mkv".into(),
+            output: "out.mp4".into(),
+            source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: crate::EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            overwrite: false,
+            settings,
+        };
+        let args = FfmpegEngine::encode_args(&request);
+        assert!(args.windows(2).any(|pair| {
+            pair
+                == [
+                    "-vf",
+                    "crop=iw-70:ih-30:30:10,scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                ]
+        }));
+    }
+
+    #[test]
+    fn temporary_output_requires_explicit_overwrite() {
+        let destination = test_output_path("no-overwrite");
+        std::fs::write(&destination, b"original").expect("create destination fixture");
+        let temporary = TemporaryOutput::new(&destination).expect("create temporary output");
+        std::fs::write(temporary.path(), b"replacement").expect("write temporary fixture");
+        let result = temporary.commit(&destination, false);
+        assert!(matches!(result, Err(Error::OutputExists(_))));
+        assert_eq!(
+            std::fs::read(&destination).expect("read original destination"),
+            b"original"
+        );
+        let _ = std::fs::remove_file(destination);
+    }
+
+    #[test]
+    fn successful_overwrite_is_committed_after_completion() {
+        let destination = test_output_path("overwrite");
+        std::fs::write(&destination, b"original").expect("create destination fixture");
+        let temporary = TemporaryOutput::new(&destination).expect("create temporary output");
+        std::fs::write(temporary.path(), b"replacement").expect("write temporary fixture");
+        assert_eq!(
+            std::fs::read(&destination).expect("read destination before commit"),
+            b"original"
+        );
+        temporary
+            .commit(&destination, true)
+            .expect("commit replacement");
+        assert_eq!(
+            std::fs::read(&destination).expect("read committed destination"),
+            b"replacement"
+        );
+        let _ = std::fs::remove_file(destination);
+    }
+
+    fn test_output_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "carbon-disc-{label}-{}-{nanos}.mp4",
+            std::process::id()
+        ))
     }
 
     #[test]

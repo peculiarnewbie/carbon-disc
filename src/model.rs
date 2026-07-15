@@ -61,7 +61,11 @@ pub struct EncodeRequest {
     pub input: PathBuf,
     pub output: PathBuf,
     pub source_duration_secs: f64,
+    pub source_width: Option<u32>,
+    pub source_height: Option<u32>,
     pub range: EncodeRange,
+    pub audio_tracks: Vec<AudioTrackSettings>,
+    pub overwrite: bool,
     pub settings: EncodeSettings,
 }
 
@@ -76,6 +80,43 @@ impl EncodeRequest {
             return Err(crate::Error::InvalidRequest("output path is empty".into()));
         }
         self.range.validate(self.source_duration_secs)?;
+        if let (Some(width), Some(height)) = (self.source_width, self.source_height)
+            && (self
+                .settings
+                .crop
+                .left
+                .saturating_add(self.settings.crop.right)
+                >= width
+                || self
+                    .settings
+                    .crop
+                    .top
+                    .saturating_add(self.settings.crop.bottom)
+                    >= height)
+        {
+            return Err(crate::Error::InvalidRequest(
+                "crop margins remove the entire picture".into(),
+            ));
+        }
+        if self.settings.max_width == Some(0) || self.settings.max_height == Some(0) {
+            return Err(crate::Error::InvalidRequest(
+                "output dimensions must be greater than zero".into(),
+            ));
+        }
+        let mut indices = std::collections::HashSet::new();
+        for track in &self.audio_tracks {
+            if !indices.insert(track.source_index) {
+                return Err(crate::Error::InvalidRequest(format!(
+                    "audio stream {} was selected more than once",
+                    track.source_index
+                )));
+            }
+            if track.encoder != AudioEncoder::Copy && track.bitrate_kbps == 0 {
+                return Err(crate::Error::InvalidRequest(
+                    "audio bitrate must be greater than zero".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -83,6 +124,13 @@ impl EncodeRequest {
     pub fn output_duration_secs(&self) -> f64 {
         self.range.duration_secs(self.source_duration_secs)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioTrackSettings {
+    pub source_index: u32,
+    pub encoder: AudioEncoder,
+    pub bitrate_kbps: u16,
 }
 
 /// A half-open time range in the source. `end_secs: None` means the end of the source.
@@ -153,6 +201,29 @@ pub struct EncodeSettings {
     pub audio_bitrate_kbps: u16,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
+    pub crop: CropMargins,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CropMargins {
+    pub top: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub right: u32,
+}
+
+impl CropMargins {
+    pub const ZERO: Self = Self {
+        top: 0,
+        bottom: 0,
+        left: 0,
+        right: 0,
+    };
+
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.top == 0 && self.bottom == 0 && self.left == 0 && self.right == 0
+    }
 }
 
 impl Default for EncodeSettings {
@@ -249,6 +320,7 @@ impl Preset {
                 audio_bitrate_kbps: 160,
                 max_width: Some(1920),
                 max_height: Some(1080),
+                crop: CropMargins::ZERO,
             },
             Self::Balanced => EncodeSettings {
                 container: Container::Mp4,
@@ -259,6 +331,7 @@ impl Preset {
                 audio_bitrate_kbps: 192,
                 max_width: None,
                 max_height: None,
+                crop: CropMargins::ZERO,
             },
             Self::HighQuality => EncodeSettings {
                 container: Container::Matroska,
@@ -269,6 +342,7 @@ impl Preset {
                 audio_bitrate_kbps: 192,
                 max_width: None,
                 max_height: None,
+                crop: CropMargins::ZERO,
             },
             Self::SmallAv1 => EncodeSettings {
                 container: Container::Matroska,
@@ -279,6 +353,7 @@ impl Preset {
                 audio_bitrate_kbps: 128,
                 max_width: None,
                 max_height: None,
+                crop: CropMargins::ZERO,
             },
         }
     }
@@ -294,9 +369,30 @@ mod tests {
             input: "source.mkv".into(),
             output: "clip.mp4".into(),
             source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
             range: EncodeRange::new(30.0, 20.0),
+            audio_tracks: Vec::new(),
+            overwrite: false,
             settings: EncodeSettings::default(),
         };
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_crop_that_removes_the_picture() {
+        let mut request = EncodeRequest {
+            input: "source.mkv".into(),
+            output: "clip.mp4".into(),
+            source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            overwrite: false,
+            settings: EncodeSettings::default(),
+        };
+        request.settings.crop.left = 1920;
         assert!(request.validate().is_err());
     }
 }

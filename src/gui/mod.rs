@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -7,9 +8,9 @@ use std::{
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
-    EncodeRange, EncodeRequest, EncodeSettings,
+    AudioTrackSettings, EncodeRange, EncodeRequest, EncodeSettings,
     engine::ffmpeg::FfmpegEngine,
-    model::{Container, MediaInfo, Preset},
+    model::{AudioEncoder, Container, MediaInfo, Preset},
     queue::{Command, Coordinator, Event, JobSnapshot, JobState},
 };
 
@@ -32,6 +33,9 @@ pub struct App {
     preview_loading: bool,
     preview_error: Option<String>,
     preview_due: Option<Instant>,
+    selected_audio_tracks: BTreeSet<u32>,
+    pending_overwrite: Option<EncodeRequest>,
+    request_error: Option<String>,
     jobs: Vec<JobSnapshot>,
     selected_job: Option<u64>,
 }
@@ -61,6 +65,9 @@ impl App {
             preview_loading: false,
             preview_error: None,
             preview_due: None,
+            selected_audio_tracks: BTreeSet::new(),
+            pending_overwrite: None,
+            request_error: None,
             jobs: Vec::new(),
             selected_job: None,
         }
@@ -81,6 +88,10 @@ impl App {
                     self.probing = false;
                     match result {
                         Ok(media) => {
+                            self.selected_audio_tracks.clear();
+                            if let Some(first_audio) = media.audio_streams().next() {
+                                self.selected_audio_tracks.insert(first_audio.index);
+                            }
                             self.trim_start_secs = 0.0;
                             self.trim_end_secs = media.duration_secs;
                             self.preview_at_secs = 0.0;
@@ -153,6 +164,8 @@ impl App {
             input: media.path.clone(),
             output: PathBuf::from(&self.output),
             source_duration_secs: media.duration_secs,
+            source_width: media.video_stream().and_then(|stream| stream.width),
+            source_height: media.video_stream().and_then(|stream| stream.height),
             range: if self.trim_start_secs <= 0.0
                 && self.trim_end_secs >= media.duration_secs - 0.05
             {
@@ -160,9 +173,24 @@ impl App {
             } else {
                 EncodeRange::new(self.trim_start_secs, self.trim_end_secs)
             },
+            audio_tracks: self
+                .selected_audio_tracks
+                .iter()
+                .map(|&source_index| AudioTrackSettings {
+                    source_index,
+                    encoder: self.settings.audio_encoder,
+                    bitrate_kbps: self.settings.audio_bitrate_kbps,
+                })
+                .collect(),
+            overwrite: false,
             settings: self.settings.clone(),
         };
-        if request.validate().is_ok() {
+        if let Err(error) = request.validate() {
+            self.request_error = Some(error.to_string());
+        } else if request.output.exists() {
+            self.pending_overwrite = Some(request);
+        } else {
+            self.request_error = None;
             self.coordinator.send(Command::Add(request));
         }
     }
@@ -275,6 +303,7 @@ impl eframe::App for App {
                     ui.label("Asking FFprobe for tracks and metadata…");
                 });
         }
+        self.overwrite_modal(&context);
     }
 }
 
@@ -429,6 +458,10 @@ impl App {
                 ui.end_row();
             });
         ui.add_space(24.0);
+        self.audio_ui(ui);
+        ui.add_space(24.0);
+        self.picture_ui(ui);
+        ui.add_space(24.0);
         heading(ui, "RANGE");
         if let Some(source_duration) = self.media.as_ref().map(|media| media.duration_secs) {
             if source_duration > 0.1 {
@@ -468,13 +501,20 @@ impl App {
                             ui.label(RichText::new("Loading frame…").color(theme::MUTED));
                         }
                     });
+                    let crop_overlay = self.media.as_ref().and_then(|media| {
+                        let video = media.video_stream()?;
+                        Some((video.width?, video.height?, self.settings.crop))
+                    });
                     if let Some(texture) = &self.preview_texture {
                         ui.vertical_centered(|ui| {
-                            ui.add(
+                            let response = ui.add(
                                 egui::Image::new(texture)
                                     .max_size(egui::vec2(ui.available_width(), 240.0))
                                     .corner_radius(6),
                             );
+                            if let Some((width, height, crop)) = crop_overlay {
+                                paint_crop_overlay(ui, response.rect, width, height, crop);
+                            }
                         });
                     } else if !self.preview_loading {
                         ui.allocate_ui_with_layout(
@@ -570,7 +610,251 @@ impl App {
                 }
             }
         });
-        ui.label(RichText::new("The output is overwritten only after the job starts; FFmpeg writes directly to this path.").small().color(theme::MUTED));
+        ui.label(RichText::new("Encodes are written to a temporary file beside the destination and committed only after FFmpeg succeeds.").small().color(theme::MUTED));
+        if let Some(error) = &self.request_error {
+            ui.colored_label(theme::RED, error);
+        }
+    }
+
+    fn audio_ui(&mut self, ui: &mut egui::Ui) {
+        heading(ui, "AUDIO TRACKS");
+        let tracks: Vec<_> = self
+            .media
+            .as_ref()
+            .map(|media| media.audio_streams().cloned().collect())
+            .unwrap_or_default();
+        if tracks.is_empty() {
+            ui.label(RichText::new("This source has no audio tracks.").color(theme::MUTED));
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.small_button("Select all").clicked() {
+                self.selected_audio_tracks
+                    .extend(tracks.iter().map(|track| track.index));
+            }
+            if ui.small_button("Select none").clicked() {
+                self.selected_audio_tracks.clear();
+            }
+            ui.label(
+                RichText::new(format!(
+                    "{} of {} selected",
+                    self.selected_audio_tracks.len(),
+                    tracks.len()
+                ))
+                .color(theme::MUTED),
+            );
+        });
+        for track in tracks {
+            let mut selected = self.selected_audio_tracks.contains(&track.index);
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut selected, "");
+                    ui.label(RichText::new(format!("Track {}", track.index)).strong());
+                    ui.label(track.language.as_deref().unwrap_or("und").to_uppercase());
+                    if let Some(title) = &track.title {
+                        ui.label(RichText::new(title).color(theme::MUTED));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} ch",
+                                track.codec.to_uppercase(),
+                                track.channels.unwrap_or(0)
+                            ))
+                            .color(theme::MUTED),
+                        );
+                    });
+                });
+            });
+            if selected {
+                self.selected_audio_tracks.insert(track.index);
+            } else {
+                self.selected_audio_tracks.remove(&track.index);
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Selected tracks use");
+            egui::ComboBox::from_id_salt("audio_encoder")
+                .selected_text(format!("{:?}", self.settings.audio_encoder))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.audio_encoder, AudioEncoder::Aac, "AAC");
+                    ui.selectable_value(
+                        &mut self.settings.audio_encoder,
+                        AudioEncoder::Opus,
+                        "Opus",
+                    );
+                    ui.selectable_value(
+                        &mut self.settings.audio_encoder,
+                        AudioEncoder::Copy,
+                        "Passthrough",
+                    );
+                });
+            ui.add_enabled(
+                self.settings.audio_encoder != AudioEncoder::Copy,
+                egui::DragValue::new(&mut self.settings.audio_bitrate_kbps)
+                    .range(32..=1024)
+                    .speed(16)
+                    .suffix(" kb/s"),
+            );
+        });
+        if self.selected_audio_tracks.is_empty() {
+            ui.label(RichText::new("The queued output will be video-only.").color(theme::MUTED));
+        }
+    }
+
+    fn picture_ui(&mut self, ui: &mut egui::Ui) {
+        heading(ui, "DIMENSIONS & CROP");
+        let Some((source_width, source_height)) = self.media.as_ref().and_then(|media| {
+            let video = media.video_stream()?;
+            Some((video.width?, video.height?))
+        }) else {
+            ui.label(
+                RichText::new("Open a source to adjust picture dimensions.").color(theme::MUTED),
+            );
+            return;
+        };
+
+        ui.group(|ui| {
+            let mut limited = self.settings.max_width.is_some() || self.settings.max_height.is_some();
+            if ui.checkbox(&mut limited, "Limit output resolution").changed() {
+                if limited {
+                    self.settings.max_width = Some(source_width);
+                    self.settings.max_height = Some(source_height);
+                } else {
+                    self.settings.max_width = None;
+                    self.settings.max_height = None;
+                }
+            }
+            if limited {
+                let mut width = self.settings.max_width.unwrap_or(source_width);
+                let mut height = self.settings.max_height.unwrap_or(source_height);
+                ui.horizontal(|ui| {
+                    ui.label("Maximum");
+                    ui.add(
+                        egui::DragValue::new(&mut width)
+                            .range(16..=source_width)
+                            .speed(2)
+                            .suffix(" px wide"),
+                    );
+                    ui.label("×");
+                    ui.add(
+                        egui::DragValue::new(&mut height)
+                            .range(16..=source_height)
+                            .speed(2)
+                            .suffix(" px high"),
+                    );
+                });
+                self.settings.max_width = Some(width.max(16) & !1);
+                self.settings.max_height = Some(height.max(16) & !1);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Crop margins").strong());
+                if ui.small_button("Reset crop").clicked() {
+                    self.settings.crop = crate::CropMargins::ZERO;
+                }
+            });
+            let crop = &mut self.settings.crop;
+            egui::Grid::new("crop_margins")
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Top");
+                    ui.add(
+                        egui::DragValue::new(&mut crop.top)
+                            .range(0..=source_height.saturating_sub(crop.bottom + 16))
+                            .speed(2),
+                    );
+                    ui.label("Bottom");
+                    ui.add(
+                        egui::DragValue::new(&mut crop.bottom)
+                            .range(0..=source_height.saturating_sub(crop.top + 16))
+                            .speed(2),
+                    );
+                    ui.end_row();
+                    ui.label("Left");
+                    ui.add(
+                        egui::DragValue::new(&mut crop.left)
+                            .range(0..=source_width.saturating_sub(crop.right + 16))
+                            .speed(2),
+                    );
+                    ui.label("Right");
+                    ui.add(
+                        egui::DragValue::new(&mut crop.right)
+                            .range(0..=source_width.saturating_sub(crop.left + 16))
+                            .speed(2),
+                    );
+                    ui.end_row();
+                });
+            crop.top &= !1;
+            crop.bottom &= !1;
+            crop.left &= !1;
+            crop.right &= !1;
+
+            let cropped_width = source_width.saturating_sub(crop.left + crop.right).max(2);
+            let cropped_height = source_height.saturating_sub(crop.top + crop.bottom).max(2);
+            let (output_width, output_height) = scaled_dimensions(
+                cropped_width,
+                cropped_height,
+                self.settings.max_width,
+                self.settings.max_height,
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Source {source_width}×{source_height} · Cropped {cropped_width}×{cropped_height} · Output {output_width}×{output_height}"
+                ))
+                .small()
+                .color(theme::MUTED),
+            );
+        });
+    }
+
+    fn overwrite_modal(&mut self, context: &egui::Context) {
+        let Some(path) = self
+            .pending_overwrite
+            .as_ref()
+            .map(|request| request.output.clone())
+        else {
+            return;
+        };
+        let mut replace = false;
+        let mut cancel = false;
+        egui::Window::new("Replace existing output?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                ui.label("A file already exists at this destination:");
+                ui.monospace(path.display().to_string());
+                ui.label(
+                    RichText::new(
+                        "The existing file is kept until the new encode completes successfully.",
+                    )
+                    .color(theme::MUTED),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .button(RichText::new("Replace after encoding").color(theme::RED))
+                        .clicked()
+                    {
+                        replace = true;
+                    }
+                });
+            });
+        if cancel {
+            self.pending_overwrite = None;
+        } else if replace && let Some(mut request) = self.pending_overwrite.take() {
+            request.overwrite = true;
+            self.request_error = None;
+            self.coordinator.send(Command::Add(request));
+        }
     }
 
     fn queue_ui(&mut self, ui: &mut egui::Ui) {
@@ -686,6 +970,59 @@ fn format_timecode(seconds: f64, precise: bool) -> String {
         )
     }
 }
+
+fn scaled_dimensions(
+    width: u32,
+    height: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> (u32, u32) {
+    let width_scale = max_width.map_or(1.0, |limit| f64::from(limit) / f64::from(width));
+    let height_scale = max_height.map_or(1.0, |limit| f64::from(limit) / f64::from(height));
+    let scale = width_scale.min(height_scale).min(1.0);
+    let output_width = ((f64::from(width) * scale).round() as u32).max(2) & !1;
+    let output_height = ((f64::from(height) * scale).round() as u32).max(2) & !1;
+    (output_width, output_height)
+}
+
+fn paint_crop_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    source_width: u32,
+    source_height: u32,
+    crop: crate::CropMargins,
+) {
+    if crop.is_zero() || source_width == 0 || source_height == 0 {
+        return;
+    }
+    let left = rect.left() + rect.width() * crop.left as f32 / source_width as f32;
+    let right = rect.right() - rect.width() * crop.right as f32 / source_width as f32;
+    let top = rect.top() + rect.height() * crop.top as f32 / source_height as f32;
+    let bottom = rect.bottom() - rect.height() * crop.bottom as f32 / source_height as f32;
+    let shade = Color32::from_black_alpha(180);
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), top)),
+        0.0,
+        shade,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(rect.left(), bottom), rect.max),
+        0.0,
+        shade,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(rect.left(), top), egui::pos2(left, bottom)),
+        0.0,
+        shade,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(right, top), egui::pos2(rect.right(), bottom)),
+        0.0,
+        shade,
+    );
+}
+
 fn bytes(value: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut n = value as f64;
