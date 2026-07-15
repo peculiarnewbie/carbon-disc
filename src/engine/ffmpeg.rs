@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
@@ -9,13 +9,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
 
 use crate::{
-    EncodeRequest, Error, MediaInfo, PreviewFrame, Result,
+    EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame, Result,
     model::{AudioEncoder, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
 };
 
@@ -55,12 +55,7 @@ impl FfmpegEngine {
     #[must_use]
     pub fn encode_args_for_output(request: &EncodeRequest, output: &Path) -> Vec<OsString> {
         let settings = &request.settings;
-        let video_codec = match settings.video_encoder {
-            VideoEncoder::H264 => "libx264",
-            VideoEncoder::H265 => "libx265",
-            VideoEncoder::Av1 => "libsvtav1",
-            VideoEncoder::Vp9 => "libvpx-vp9",
-        };
+        let video_codec = settings.video_encoder.ffmpeg_name();
         let preset = match (settings.video_encoder, settings.speed) {
             (VideoEncoder::Av1, EncoderSpeed::Fast) => "10",
             (VideoEncoder::Av1, EncoderSpeed::Balanced) => "7",
@@ -70,6 +65,12 @@ impl FfmpegEngine {
             (_, EncoderSpeed::Quality) => "slow",
         };
         let mut args = vec!["-hide_banner".into(), "-y".into()];
+        if settings.video_encoder.is_vaapi() {
+            args.extend([
+                OsString::from("-vaapi_device"),
+                OsString::from("/dev/dri/renderD128"),
+            ]);
+        }
         if request.range.start_secs > 0.0 {
             args.extend([
                 OsString::from("-ss"),
@@ -91,29 +92,78 @@ impl FfmpegEngine {
             ]);
         }
         args.extend([OsString::from("-c:v"), video_codec.into()]);
-        if settings.video_encoder == VideoEncoder::Vp9 {
-            let cpu_used = match settings.speed {
-                EncoderSpeed::Fast => "6",
-                EncoderSpeed::Balanced => "4",
-                EncoderSpeed::Quality => "2",
-            };
-            args.extend([
-                OsString::from("-crf"),
-                settings.quality.to_string().into(),
-                OsString::from("-b:v"),
-                OsString::from("0"),
-                OsString::from("-deadline"),
-                OsString::from("good"),
-                OsString::from("-cpu-used"),
-                cpu_used.into(),
-            ]);
-        } else {
-            args.extend([
-                OsString::from("-crf"),
-                settings.quality.to_string().into(),
-                OsString::from("-preset"),
-                preset.into(),
-            ]);
+        match settings.video_encoder {
+            VideoEncoder::H264 | VideoEncoder::H265 | VideoEncoder::Av1 => {
+                args.extend([
+                    OsString::from("-crf"),
+                    settings.quality.to_string().into(),
+                    OsString::from("-preset"),
+                    preset.into(),
+                ]);
+            }
+            VideoEncoder::Vp9 => {
+                let cpu_used = match settings.speed {
+                    EncoderSpeed::Fast => "6",
+                    EncoderSpeed::Balanced => "4",
+                    EncoderSpeed::Quality => "2",
+                };
+                args.extend([
+                    OsString::from("-crf"),
+                    settings.quality.to_string().into(),
+                    OsString::from("-b:v"),
+                    OsString::from("0"),
+                    OsString::from("-deadline"),
+                    OsString::from("good"),
+                    OsString::from("-cpu-used"),
+                    cpu_used.into(),
+                ]);
+            }
+            VideoEncoder::NvencH264 | VideoEncoder::NvencH265 | VideoEncoder::NvencAv1 => {
+                let preset = match settings.speed {
+                    EncoderSpeed::Fast => "p3",
+                    EncoderSpeed::Balanced => "p5",
+                    EncoderSpeed::Quality => "p7",
+                };
+                args.extend([
+                    OsString::from("-rc"),
+                    OsString::from("vbr"),
+                    OsString::from("-cq"),
+                    settings.quality.to_string().into(),
+                    OsString::from("-b:v"),
+                    OsString::from("0"),
+                    OsString::from("-preset"),
+                    preset.into(),
+                ]);
+            }
+            VideoEncoder::QsvH264 | VideoEncoder::QsvH265 | VideoEncoder::QsvAv1 => {
+                args.extend([
+                    OsString::from("-global_quality"),
+                    settings.quality.to_string().into(),
+                    OsString::from("-preset"),
+                    preset.into(),
+                ]);
+            }
+            VideoEncoder::AmfH264 | VideoEncoder::AmfH265 | VideoEncoder::AmfAv1 => {
+                let quality = match settings.speed {
+                    EncoderSpeed::Fast => "speed",
+                    EncoderSpeed::Balanced => "balanced",
+                    EncoderSpeed::Quality => "quality",
+                };
+                args.extend([
+                    OsString::from("-quality"),
+                    quality.into(),
+                    OsString::from("-qp_i"),
+                    settings.quality.to_string().into(),
+                    OsString::from("-qp_p"),
+                    settings.quality.to_string().into(),
+                ]);
+            }
+            VideoEncoder::VaapiH264 | VideoEncoder::VaapiH265 | VideoEncoder::VaapiAv1 => {
+                args.extend([OsString::from("-qp"), settings.quality.to_string().into()]);
+            }
+            VideoEncoder::VideoToolboxH264 | VideoEncoder::VideoToolboxH265 => {
+                args.extend([OsString::from("-q:v"), settings.quality.to_string().into()]);
+            }
         }
         for (output_index, track) in request.audio_tracks.iter().enumerate() {
             let codec_option = format!("-c:a:{output_index}");
@@ -155,6 +205,9 @@ impl FfmpegEngine {
                 .map_or_else(|| "ih".into(), |v| v.to_string());
             filters.push(format!("scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"));
         }
+        if settings.video_encoder.is_vaapi() {
+            filters.push("format=nv12,hwupload".into());
+        }
         if !filters.is_empty() {
             args.extend([OsString::from("-vf"), filters.join(",").into()]);
         }
@@ -193,11 +246,85 @@ impl FfmpegEngine {
             "pipe:1".into(),
         ]
     }
+
+    fn encoder_initializes(&self, encoder: VideoEncoder) -> bool {
+        if encoder.is_vaapi() && !Path::new("/dev/dri/renderD128").exists() {
+            return false;
+        }
+        let mut command = Command::new(&self.ffmpeg);
+        command.args(["-hide_banner", "-loglevel", "error"]);
+        if encoder.is_vaapi() {
+            command.args(["-vaapi_device", "/dev/dri/renderD128"]);
+        }
+        command.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=64x64:rate=1",
+            "-frames:v",
+            "1",
+        ]);
+        if encoder.is_vaapi() {
+            command.args(["-vf", "format=nv12,hwupload"]);
+        }
+        let Ok(mut child) = command
+            .args(["-an", "-c:v", encoder.ffmpeg_name(), "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 impl MediaEngine for FfmpegEngine {
     fn name(&self) -> &'static str {
         "FFmpeg"
+    }
+
+    fn capabilities(&self) -> Result<EngineCapabilities> {
+        let output = Command::new(&self.ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map_err(|source| Error::Launch {
+                program: self.ffmpeg.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(Error::Process {
+                program: self.ffmpeg.display().to_string(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let names: HashSet<_> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let flags = fields.next()?;
+                let name = fields.next()?;
+                flags.starts_with('V').then_some(name.to_owned())
+            })
+            .collect();
+        let video_encoders = VideoEncoder::ALL
+            .into_iter()
+            .filter(|encoder| names.contains(encoder.ffmpeg_name()))
+            .filter(|encoder| !encoder.is_hardware() || self.encoder_initializes(*encoder))
+            .collect();
+        Ok(EngineCapabilities { video_encoders })
     }
 
     fn probe(&self, path: &Path) -> Result<MediaInfo> {
@@ -553,6 +680,30 @@ mod tests {
         assert_eq!(request.settings, Preset::Balanced.settings());
         assert!(args.windows(2).any(|pair| pair == ["-map", "0:2"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a:0", "aac"]));
+    }
+
+    #[test]
+    fn hardware_encoder_uses_its_native_quality_controls() {
+        let settings = EncodeSettings {
+            video_encoder: VideoEncoder::NvencH265,
+            quality: 21,
+            ..EncodeSettings::default()
+        };
+        let request = EncodeRequest {
+            input: "in.mkv".into(),
+            output: "out.mp4".into(),
+            source_duration_secs: 10.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: crate::EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            overwrite: false,
+            settings,
+        };
+        let args = FfmpegEngine::encode_args(&request);
+        assert!(args.windows(2).any(|pair| pair == ["-c:v", "hevc_nvenc"]));
+        assert!(args.windows(2).any(|pair| pair == ["-cq", "21"]));
+        assert!(!args.iter().any(|arg| arg == "-crf"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,7 +9,10 @@ use std::{
     thread,
 };
 
-use crate::{EncodeRequest, MediaEngine, MediaInfo, PreviewFrame, engine::EngineEvent};
+use crate::{
+    AudioTrackSettings, EncodeRange, EncodeRequest, EncodeSettings, EngineCapabilities,
+    MediaEngine, MediaInfo, PreviewFrame, engine::EngineEvent,
+};
 
 pub type JobId = u64;
 type ActiveJob = (JobId, Arc<AtomicBool>, Receiver<(JobId, crate::Result<()>)>);
@@ -39,6 +43,14 @@ pub enum Command {
         path: std::path::PathBuf,
         at_secs: f64,
     },
+    BatchFiles {
+        paths: Vec<PathBuf>,
+        settings: EncodeSettings,
+    },
+    BatchFolder {
+        path: PathBuf,
+        settings: EncodeSettings,
+    },
     Add(EncodeRequest),
     Remove(JobId),
     Start,
@@ -56,6 +68,16 @@ pub enum Event {
         at_secs: f64,
         result: Result<PreviewFrame, String>,
     },
+    Capabilities(Result<EngineCapabilities, String>),
+    BatchProgress {
+        current: usize,
+        total: usize,
+    },
+    BatchFinished {
+        added: usize,
+        failed: usize,
+    },
+    Notice(String),
     Snapshot(Vec<JobSnapshot>),
     Backend(String),
 }
@@ -93,8 +115,39 @@ impl Drop for Coordinator {
 
 fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender<Event>) {
     let _ = events.send(Event::Backend(engine.name().into()));
+    let capability_engine = engine.clone();
+    let capability_events = events.clone();
+    thread::spawn(move || {
+        let result = capability_engine
+            .capabilities()
+            .map_err(|error| error.to_string());
+        let _ = capability_events.send(Event::Capabilities(result));
+    });
     let mut jobs: VecDeque<JobSnapshot> = VecDeque::new();
     let mut next_id = 1;
+    match crate::persistence::load_queue() {
+        Ok(requests) => {
+            for mut request in requests {
+                request.overwrite = false;
+                let (state, error) = restored_state(&request);
+                jobs.push_back(JobSnapshot {
+                    id: next_id,
+                    request,
+                    state,
+                    progress: 0.0,
+                    speed: None,
+                    error,
+                });
+                next_id += 1;
+            }
+            if !jobs.is_empty() {
+                let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
+            }
+        }
+        Err(error) => {
+            let _ = events.send(Event::Notice(format!("Could not restore queue: {error}")));
+        }
+    }
     let mut processing = false;
     let mut active: Option<ActiveJob> = None;
     loop {
@@ -115,6 +168,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 }
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
                 active = None;
+                persist_jobs(&jobs, &events);
             } else {
                 let _ = (id, cancelled);
             }
@@ -142,6 +196,15 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                     .map_err(|error| error.to_string());
                 let _ = events.send(Event::PreviewFinished { at_secs, result });
             }
+            Command::BatchFiles { paths, settings } => {
+                import_paths(&engine, paths, &settings, &mut jobs, &mut next_id, &events);
+                persist_jobs(&jobs, &events);
+            }
+            Command::BatchFolder { path, settings } => {
+                let paths = discover_media(&path);
+                import_paths(&engine, paths, &settings, &mut jobs, &mut next_id, &events);
+                persist_jobs(&jobs, &events);
+            }
             Command::Add(request) => {
                 jobs.push_back(JobSnapshot {
                     id: next_id,
@@ -153,10 +216,12 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 });
                 next_id += 1;
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
+                persist_jobs(&jobs, &events);
             }
             Command::Remove(id) => {
                 jobs.retain(|job| job.id != id || job.state == JobState::Running);
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
+                persist_jobs(&jobs, &events);
             }
             Command::Start => {
                 processing = true;
@@ -171,6 +236,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
             Command::ClearFinished => {
                 jobs.retain(|job| matches!(job.state, JobState::Queued | JobState::Running));
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
+                persist_jobs(&jobs, &events);
             }
             Command::Shutdown => {
                 if let Some((_, cancelled, _)) = &active {
@@ -226,4 +292,152 @@ fn maybe_start(
         let _ = result_tx.send((id, result));
     });
     *active = Some((id, cancelled, result_rx));
+}
+
+fn import_paths(
+    engine: &Arc<dyn MediaEngine>,
+    paths: Vec<PathBuf>,
+    settings: &EncodeSettings,
+    jobs: &mut VecDeque<JobSnapshot>,
+    next_id: &mut JobId,
+    events: &Sender<Event>,
+) {
+    let total = paths.len();
+    let mut added = 0;
+    let mut failed = 0;
+    for (index, path) in paths.into_iter().enumerate() {
+        let _ = events.send(Event::BatchProgress {
+            current: index + 1,
+            total,
+        });
+        match engine.probe(&path) {
+            Ok(media) => {
+                let output = suggested_output(&path, settings.container.extension());
+                let audio_tracks = media
+                    .audio_streams()
+                    .next()
+                    .map(|track| {
+                        vec![AudioTrackSettings {
+                            source_index: track.index,
+                            encoder: settings.audio_encoder,
+                            bitrate_kbps: settings.audio_bitrate_kbps,
+                        }]
+                    })
+                    .unwrap_or_default();
+                let request = EncodeRequest {
+                    input: path,
+                    output,
+                    source_duration_secs: media.duration_secs,
+                    source_width: media.video_stream().and_then(|stream| stream.width),
+                    source_height: media.video_stream().and_then(|stream| stream.height),
+                    range: EncodeRange::ALL,
+                    audio_tracks,
+                    overwrite: false,
+                    settings: settings.clone(),
+                };
+                let (state, error) = restored_state(&request);
+                jobs.push_back(JobSnapshot {
+                    id: *next_id,
+                    request,
+                    state,
+                    progress: 0.0,
+                    speed: None,
+                    error,
+                });
+                *next_id += 1;
+                added += 1;
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
+    let _ = events.send(Event::BatchFinished { added, failed });
+}
+
+fn discover_media(root: &Path) -> Vec<PathBuf> {
+    const EXTENSIONS: [&str; 10] = [
+        "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mts", "m2ts", "mpg",
+    ];
+    let mut media = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                pending.extend(
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .map(|entry| entry.path()),
+                );
+            }
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                EXTENSIONS
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
+        {
+            media.push(path);
+        }
+    }
+    media.sort();
+    media
+}
+
+fn suggested_output(input: &Path, extension: &str) -> PathBuf {
+    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+    input.with_file_name(format!("{stem}-encoded.{extension}"))
+}
+
+fn restored_state(request: &EncodeRequest) -> (JobState, Option<String>) {
+    if !request.input.exists() {
+        (
+            JobState::Failed,
+            Some(format!("Source is missing: {}", request.input.display())),
+        )
+    } else if request.output.exists() {
+        (
+            JobState::Failed,
+            Some(format!(
+                "Destination already exists: {}. Remove and re-add this job to confirm replacement.",
+                request.output.display()
+            )),
+        )
+    } else {
+        (JobState::Queued, None)
+    }
+}
+
+fn persist_jobs(jobs: &VecDeque<JobSnapshot>, events: &Sender<Event>) {
+    let requests: Vec<_> = jobs
+        .iter()
+        .filter(|job| matches!(job.state, JobState::Queued | JobState::Running))
+        .map(|job| job.request.clone())
+        .collect();
+    if let Err(error) = crate::persistence::save_queue(&requests) {
+        let _ = events.send(Event::Notice(format!("Could not save queue: {error}")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_discovery_is_recursive_and_filtered() {
+        let root =
+            std::env::temp_dir().join(format!("carbon-disc-discovery-{}", std::process::id()));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create discovery fixture");
+        std::fs::write(root.join("one.MKV"), b"").expect("create video fixture");
+        std::fs::write(nested.join("two.mp4"), b"").expect("create nested video fixture");
+        std::fs::write(root.join("notes.txt"), b"").expect("create text fixture");
+        let found = discover_media(&root);
+        assert_eq!(found.len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -11,6 +11,9 @@ struct Args {
     /// Probe a media file as JSON and exit without opening the GUI.
     #[arg(long, value_name = "FILE")]
     probe: Option<PathBuf>,
+    /// Print encoders that FFmpeg can initialize on this machine and exit.
+    #[arg(long)]
+    capabilities: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,6 +21,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = args.probe {
         let info = FfmpegEngine::default().probe(&path)?;
         println!("{}", serde_json::to_string_pretty(&info)?);
+        return Ok(());
+    }
+    if args.capabilities {
+        for encoder in FfmpegEngine::default().capabilities()?.video_encoders {
+            let kind = if encoder.is_hardware() {
+                "hardware"
+            } else {
+                "software"
+            };
+            println!("{}\t{kind}", encoder.display_name());
+        }
         return Ok(());
     }
     let options = eframe::NativeOptions {

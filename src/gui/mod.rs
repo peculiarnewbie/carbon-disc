@@ -8,9 +8,9 @@ use std::{
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
-    AudioTrackSettings, EncodeRange, EncodeRequest, EncodeSettings,
+    AudioTrackSettings, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
     engine::ffmpeg::FfmpegEngine,
-    model::{AudioEncoder, Container, MediaInfo, Preset},
+    model::{AudioEncoder, Container, EngineCapabilities, MediaInfo, Preset},
     queue::{Command, Coordinator, Event, JobSnapshot, JobState},
 };
 
@@ -38,6 +38,14 @@ pub struct App {
     request_error: Option<String>,
     jobs: Vec<JobSnapshot>,
     selected_job: Option<u64>,
+    capabilities: Option<EngineCapabilities>,
+    capability_error: Option<String>,
+    custom_presets: Vec<CustomPreset>,
+    selected_custom_preset: Option<String>,
+    show_save_preset: bool,
+    preset_name_input: String,
+    preset_description_input: String,
+    batch_status: Option<String>,
 }
 
 impl App {
@@ -49,6 +57,13 @@ impl App {
         if let Some(path) = initial_path {
             coordinator.send(Command::Probe(path));
         }
+        let (custom_presets, request_error) = match crate::persistence::load_presets() {
+            Ok(presets) => (presets, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Could not load custom presets: {error}")),
+            ),
+        };
         Self {
             coordinator,
             backend: "Detecting backend…".into(),
@@ -67,9 +82,17 @@ impl App {
             preview_due: None,
             selected_audio_tracks: BTreeSet::new(),
             pending_overwrite: None,
-            request_error: None,
+            request_error,
             jobs: Vec::new(),
             selected_job: None,
+            capabilities: None,
+            capability_error: None,
+            custom_presets,
+            selected_custom_preset: None,
+            show_save_preset: false,
+            preset_name_input: String::new(),
+            preset_description_input: String::new(),
+            batch_status: None,
         }
     }
 
@@ -129,6 +152,24 @@ impl App {
                         }
                     }
                 }
+                Event::Capabilities(result) => match result {
+                    Ok(capabilities) => {
+                        self.capabilities = Some(capabilities);
+                        self.capability_error = None;
+                    }
+                    Err(error) => self.capability_error = Some(error),
+                },
+                Event::BatchProgress { current, total } => {
+                    self.batch_status = Some(format!("Importing {current} of {total}…"));
+                }
+                Event::BatchFinished { added, failed } => {
+                    self.batch_status = Some(if failed == 0 {
+                        format!("Added {added} files to the queue")
+                    } else {
+                        format!("Added {added} files; skipped {failed}")
+                    });
+                }
+                Event::Notice(message) => self.request_error = Some(message),
                 Event::Snapshot(snapshot) => self.merge_snapshot(snapshot),
             }
             context.request_repaint();
@@ -153,6 +194,34 @@ impl App {
             .pick_file()
         {
             self.coordinator.send(Command::Probe(path));
+        }
+    }
+
+    fn add_batch_files(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "Video",
+                &[
+                    "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mts", "m2ts", "mpg",
+                ],
+            )
+            .pick_files()
+        {
+            self.batch_status = Some(format!("Preparing {} files…", paths.len()));
+            self.coordinator.send(Command::BatchFiles {
+                paths,
+                settings: self.settings.clone(),
+            });
+        }
+    }
+
+    fn add_batch_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.batch_status = Some("Scanning folder…".into());
+            self.coordinator.send(Command::BatchFolder {
+                path,
+                settings: self.settings.clone(),
+            });
         }
     }
 
@@ -239,9 +308,28 @@ impl eframe::App for App {
                     if ui.button("＋ Open source").clicked() {
                         self.open_source();
                     }
+                    let encoder_available =
+                        self.capabilities.as_ref().is_some_and(|capabilities| {
+                            capabilities
+                                .video_encoders
+                                .contains(&self.settings.video_encoder)
+                        });
+                    if ui
+                        .add_enabled(encoder_available, egui::Button::new("Batch files…"))
+                        .clicked()
+                    {
+                        self.add_batch_files();
+                    }
+                    if ui
+                        .add_enabled(encoder_available, egui::Button::new("Folder…"))
+                        .clicked()
+                    {
+                        self.add_batch_folder();
+                    }
                     let can_queue = self.media.is_some()
                         && !self.output.is_empty()
-                        && self.trim_end_secs - self.trim_start_secs >= 0.1;
+                        && self.trim_end_secs - self.trim_start_secs >= 0.1
+                        && encoder_available;
                     if ui
                         .add_enabled(can_queue, egui::Button::new("Add to queue"))
                         .clicked()
@@ -270,6 +358,9 @@ impl eframe::App for App {
                         ui.label(RichText::new(&self.backend).small().color(theme::MUTED));
                     });
                 });
+                if let Some(status) = &self.batch_status {
+                    ui.label(RichText::new(status).small().color(theme::MUTED));
+                }
             });
 
         egui::Panel::bottom("queue")
@@ -304,6 +395,7 @@ impl eframe::App for App {
                 });
         }
         self.overwrite_modal(&context);
+        self.preset_modal(&context);
     }
 }
 
@@ -410,13 +502,14 @@ impl App {
         heading(ui, "PRESET");
         ui.horizontal_wrapped(|ui| {
             for preset in Preset::ALL {
-                let selected = self.preset == preset;
+                let selected = self.selected_custom_preset.is_none() && self.preset == preset;
                 if ui
                     .selectable_label(selected, preset.name())
                     .on_hover_text(preset.description())
                     .clicked()
                 {
                     self.preset = preset;
+                    self.selected_custom_preset = None;
                     self.settings = preset.settings();
                     if let Some(media) = &self.media {
                         self.output = suggested_output(&media.path, self.settings.container)
@@ -426,6 +519,7 @@ impl App {
                 }
             }
         });
+        self.custom_presets_ui(ui);
         ui.add_space(18.0);
         egui::Grid::new("settings")
             .num_columns(2)
@@ -433,10 +527,32 @@ impl App {
             .spacing([24.0, 12.0])
             .show(ui, |ui| {
                 ui.label("Video encoder");
-                ui.label(format!("{:?}", self.settings.video_encoder));
+                if let Some(capabilities) = &self.capabilities {
+                    egui::ComboBox::from_id_salt("video_encoder")
+                        .selected_text(self.settings.video_encoder.display_name())
+                        .show_ui(ui, |ui| {
+                            for encoder in &capabilities.video_encoders {
+                                let label = if encoder.is_hardware() {
+                                    format!("⚡ {}", encoder.display_name())
+                                } else {
+                                    encoder.display_name().to_owned()
+                                };
+                                ui.selectable_value(
+                                    &mut self.settings.video_encoder,
+                                    *encoder,
+                                    label,
+                                );
+                            }
+                        });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Detecting available encoders…");
+                    });
+                }
                 ui.end_row();
-                ui.label("Constant quality");
-                ui.add(egui::Slider::new(&mut self.settings.quality, 0..=51).text("CRF"));
+                ui.label("Quality value");
+                ui.add(egui::Slider::new(&mut self.settings.quality, 0..=51));
                 ui.end_row();
                 ui.label("Encoder speed");
                 ui.label(format!("{:?}", self.settings.speed));
@@ -457,6 +573,18 @@ impl App {
                 });
                 ui.end_row();
             });
+        if let Some(error) = &self.capability_error {
+            ui.colored_label(theme::RED, format!("Encoder detection failed: {error}"));
+        } else if let Some(capabilities) = &self.capabilities
+            && !capabilities
+                .video_encoders
+                .contains(&self.settings.video_encoder)
+        {
+            ui.colored_label(
+                theme::RED,
+                "This preset's video encoder is unavailable on this machine.",
+            );
+        }
         ui.add_space(24.0);
         self.audio_ui(ui);
         ui.add_space(24.0);
@@ -613,6 +741,155 @@ impl App {
         ui.label(RichText::new("Encodes are written to a temporary file beside the destination and committed only after FFmpeg succeeds.").small().color(theme::MUTED));
         if let Some(error) = &self.request_error {
             ui.colored_label(theme::RED, error);
+        }
+    }
+
+    fn custom_presets_ui(&mut self, ui: &mut egui::Ui) {
+        let mut selected_settings = None;
+        let mut delete_selected = false;
+        ui.horizontal_wrapped(|ui| {
+            for preset in &self.custom_presets {
+                if ui
+                    .selectable_label(
+                        self.selected_custom_preset.as_deref() == Some(&preset.name),
+                        &preset.name,
+                    )
+                    .on_hover_text(&preset.description)
+                    .clicked()
+                {
+                    selected_settings = Some((preset.name.clone(), preset.settings.clone()));
+                }
+            }
+            if ui.small_button("＋ Save current…").clicked() {
+                self.preset_name_input = self.selected_custom_preset.clone().unwrap_or_default();
+                self.preset_description_input = self
+                    .custom_presets
+                    .iter()
+                    .find(|preset| Some(&preset.name) == self.selected_custom_preset.as_ref())
+                    .map_or_else(String::new, |preset| preset.description.clone());
+                self.show_save_preset = true;
+            }
+            if ui
+                .add_enabled(
+                    self.selected_custom_preset.is_some(),
+                    egui::Button::new("Delete"),
+                )
+                .clicked()
+            {
+                delete_selected = true;
+            }
+            if ui.small_button("Import…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Carbon Disc presets", &["json"])
+                    .pick_file()
+            {
+                match crate::persistence::import_presets(&path) {
+                    Ok(imported) => {
+                        for preset in imported {
+                            if let Some(existing) = self
+                                .custom_presets
+                                .iter_mut()
+                                .find(|existing| existing.name == preset.name)
+                            {
+                                *existing = preset;
+                            } else {
+                                self.custom_presets.push(preset);
+                            }
+                        }
+                        self.save_custom_presets();
+                    }
+                    Err(error) => self.request_error = Some(format!("Import failed: {error}")),
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.custom_presets.is_empty(),
+                    egui::Button::new("Export…"),
+                )
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Carbon Disc presets", &["json"])
+                    .set_file_name("carbon-disc-presets.json")
+                    .save_file()
+                && let Err(error) = crate::persistence::export_presets(&path, &self.custom_presets)
+            {
+                self.request_error = Some(format!("Export failed: {error}"));
+            }
+        });
+
+        if let Some((name, settings)) = selected_settings {
+            self.selected_custom_preset = Some(name);
+            self.settings = settings;
+            if let Some(media) = &self.media {
+                self.output = suggested_output(&media.path, self.settings.container)
+                    .display()
+                    .to_string();
+            }
+        }
+        if delete_selected && let Some(name) = self.selected_custom_preset.take() {
+            self.custom_presets.retain(|preset| preset.name != name);
+            self.save_custom_presets();
+        }
+    }
+
+    fn preset_modal(&mut self, context: &egui::Context) {
+        if !self.show_save_preset {
+            return;
+        }
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Save custom preset")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(context, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.preset_name_input);
+                ui.label("Description");
+                ui.text_edit_singleline(&mut self.preset_description_input);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.preset_name_input.trim().is_empty(),
+                            egui::Button::new("Save preset"),
+                        )
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                });
+            });
+        if cancel {
+            self.show_save_preset = false;
+        } else if save {
+            let name = self.preset_name_input.trim().to_owned();
+            let preset = CustomPreset {
+                name: name.clone(),
+                description: self.preset_description_input.trim().to_owned(),
+                settings: self.settings.clone(),
+            };
+            if let Some(existing) = self
+                .custom_presets
+                .iter_mut()
+                .find(|existing| existing.name == name)
+            {
+                *existing = preset;
+            } else {
+                self.custom_presets.push(preset);
+            }
+            self.selected_custom_preset = Some(name);
+            self.show_save_preset = false;
+            self.save_custom_presets();
+        }
+    }
+
+    fn save_custom_presets(&mut self) {
+        match crate::persistence::save_presets(&self.custom_presets) {
+            Ok(()) => self.request_error = None,
+            Err(error) => self.request_error = Some(format!("Could not save presets: {error}")),
         }
     }
 

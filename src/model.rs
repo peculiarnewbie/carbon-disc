@@ -19,6 +19,18 @@ pub struct PreviewFrame {
     pub rgba: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CustomPreset {
+    pub name: String,
+    pub description: String,
+    pub settings: EncodeSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineCapabilities {
+    pub video_encoders: Vec<VideoEncoder>,
+}
+
 impl MediaInfo {
     #[must_use]
     pub fn video_stream(&self) -> Option<&MediaStream> {
@@ -256,6 +268,101 @@ pub enum VideoEncoder {
     H265,
     Av1,
     Vp9,
+    NvencH264,
+    NvencH265,
+    NvencAv1,
+    QsvH264,
+    QsvH265,
+    QsvAv1,
+    AmfH264,
+    AmfH265,
+    AmfAv1,
+    VaapiH264,
+    VaapiH265,
+    VaapiAv1,
+    VideoToolboxH264,
+    VideoToolboxH265,
+}
+
+impl VideoEncoder {
+    pub const ALL: [Self; 18] = [
+        Self::H264,
+        Self::H265,
+        Self::Av1,
+        Self::Vp9,
+        Self::NvencH264,
+        Self::NvencH265,
+        Self::NvencAv1,
+        Self::QsvH264,
+        Self::QsvH265,
+        Self::QsvAv1,
+        Self::AmfH264,
+        Self::AmfH265,
+        Self::AmfAv1,
+        Self::VaapiH264,
+        Self::VaapiH265,
+        Self::VaapiAv1,
+        Self::VideoToolboxH264,
+        Self::VideoToolboxH265,
+    ];
+
+    #[must_use]
+    pub const fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::H265 => "libx265",
+            Self::Av1 => "libsvtav1",
+            Self::Vp9 => "libvpx-vp9",
+            Self::NvencH264 => "h264_nvenc",
+            Self::NvencH265 => "hevc_nvenc",
+            Self::NvencAv1 => "av1_nvenc",
+            Self::QsvH264 => "h264_qsv",
+            Self::QsvH265 => "hevc_qsv",
+            Self::QsvAv1 => "av1_qsv",
+            Self::AmfH264 => "h264_amf",
+            Self::AmfH265 => "hevc_amf",
+            Self::AmfAv1 => "av1_amf",
+            Self::VaapiH264 => "h264_vaapi",
+            Self::VaapiH265 => "hevc_vaapi",
+            Self::VaapiAv1 => "av1_vaapi",
+            Self::VideoToolboxH264 => "h264_videotoolbox",
+            Self::VideoToolboxH265 => "hevc_videotoolbox",
+        }
+    }
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264 (x264)",
+            Self::H265 => "H.265 (x265)",
+            Self::Av1 => "AV1 (SVT-AV1)",
+            Self::Vp9 => "VP9 (libvpx)",
+            Self::NvencH264 => "H.264 (NVIDIA NVENC)",
+            Self::NvencH265 => "H.265 (NVIDIA NVENC)",
+            Self::NvencAv1 => "AV1 (NVIDIA NVENC)",
+            Self::QsvH264 => "H.264 (Intel Quick Sync)",
+            Self::QsvH265 => "H.265 (Intel Quick Sync)",
+            Self::QsvAv1 => "AV1 (Intel Quick Sync)",
+            Self::AmfH264 => "H.264 (AMD AMF)",
+            Self::AmfH265 => "H.265 (AMD AMF)",
+            Self::AmfAv1 => "AV1 (AMD AMF)",
+            Self::VaapiH264 => "H.264 (VAAPI)",
+            Self::VaapiH265 => "H.265 (VAAPI)",
+            Self::VaapiAv1 => "AV1 (VAAPI)",
+            Self::VideoToolboxH264 => "H.264 (VideoToolbox)",
+            Self::VideoToolboxH265 => "H.265 (VideoToolbox)",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_hardware(self) -> bool {
+        !matches!(self, Self::H264 | Self::H265 | Self::Av1 | Self::Vp9)
+    }
+
+    #[must_use]
+    pub const fn is_vaapi(self) -> bool {
+        matches!(self, Self::VaapiH264 | Self::VaapiH265 | Self::VaapiAv1)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

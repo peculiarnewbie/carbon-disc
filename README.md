@@ -4,10 +4,11 @@ Carbon Disc is an open-source desktop video transcoder written in Rust and power
 FFmpeg. It aims for HandBrake's approachable workflow while keeping the media backend
 behind a small, testable Rust interface.
 
-> Early development: probing, frame previews, presets, start/end range cutting,
-> audio-track selection, crop and resolution controls, safe output replacement,
-> queueing, progress, cancellation, and FFmpeg transcoding are implemented. Subtitles,
-> filters, and persisted presets are planned next.
+> Early development: probing, frame previews, start/end range cutting, audio-track
+> selection, crop and resolution controls, safe output replacement, hardware encoder
+> discovery, custom presets, recursive batch import, persistent queues, progress,
+> cancellation, and FFmpeg transcoding are implemented. Subtitles and filters are
+> planned next.
 
 ## Architecture
 
@@ -24,6 +25,7 @@ model <──────────────── shared domain values ─
 - `engine::MediaEngine` is the application/backend contract.
 - `engine::ffmpeg` is the only module that knows FFmpeg/FFprobe arguments and output.
 - `queue` owns background work and publishes immutable UI snapshots through events.
+- `persistence` owns versioned JSON documents for custom presets and unfinished jobs.
 - `gui` follows edirstat's native egui layout and dark slate/violet visual language.
 
 This process boundary is intentional. It avoids unsafe libav FFI, isolates GPL tooling,
@@ -51,8 +53,20 @@ checkout. It is useful as a product/behavior reference, but is not linked into C
 ```bash
 cargo run --release
 cargo run -- --probe /path/to/video.mkv
+cargo run -- --capabilities
 cargo test
 ```
+
+The capabilities command performs a one-frame initialization check before reporting a
+hardware encoder, avoiding devices that are compiled into FFmpeg but unusable on the
+current machine. The GUI performs the same discovery in the background and limits its
+encoder menu accordingly.
+
+Custom presets and unfinished queue entries are saved as versioned JSON in the platform's
+local application-data directory. Restored jobs never assume overwrite permission: a
+missing source or existing destination is shown as a failed job that needs attention.
+Batch files and folders use the active encode settings, select the first audio track, and
+write a sibling `<source>-encoded.<container>` destination.
 
 ## License
 

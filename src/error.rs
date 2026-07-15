@@ -10,8 +10,8 @@ pub enum Error {
     },
     #[error("{program} failed: {message}")]
     Process { program: String, message: String },
-    #[error("invalid media metadata: {0}")]
-    InvalidMetadata(#[from] serde_json::Error),
+    #[error("invalid JSON data: {0}")]
+    InvalidJson(#[from] serde_json::Error),
     #[error("invalid preview image: {0}")]
     InvalidImage(#[from] image::ImageError),
     #[error("I/O error: {0}")]
