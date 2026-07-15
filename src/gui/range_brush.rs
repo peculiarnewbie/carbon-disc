@@ -10,7 +10,6 @@ enum DragPart {
     Start,
     End,
     Playhead,
-    Selection,
 }
 
 #[derive(Clone, Copy)]
@@ -18,11 +17,10 @@ struct DragState {
     part: DragPart,
     start_secs: f64,
     end_secs: f64,
-    playhead_secs: f64,
 }
 
-/// A two-handled timeline brush. Drag either edge to trim, or drag the highlighted
-/// selection to move the whole range without changing its duration.
+/// A two-handled timeline brush. Drag either violet edge to trim. Clicking or dragging
+/// anywhere else seeks the white preview marker.
 pub fn show(
     ui: &mut egui::Ui,
     start_secs: &mut f64,
@@ -30,12 +28,12 @@ pub fn show(
     playhead_secs: &mut f64,
     duration_secs: f64,
 ) -> Response {
-    let desired_size = Vec2::new(ui.available_width().max(120.0), 42.0);
+    let desired_size = Vec2::new(ui.available_width().max(120.0), 54.0);
     let (rect, mut response) = ui.allocate_exact_size(desired_size, Sense::click_and_drag());
     let state_id = response.id.with("drag_state");
     let track = Rect::from_min_max(
-        Pos2::new(rect.left() + 10.0, rect.center().y - 4.0),
-        Pos2::new(rect.right() - 10.0, rect.center().y + 4.0),
+        Pos2::new(rect.left() + 10.0, rect.bottom() - 21.0),
+        Pos2::new(rect.right() - 10.0, rect.bottom() - 13.0),
     );
 
     *start_secs = start_secs.clamp(0.0, (duration_secs - MIN_RANGE_SECS).max(0.0));
@@ -45,22 +43,15 @@ pub fn show(
 
     let start_x = time_to_x(*start_secs, duration_secs, track);
     let end_x = time_to_x(*end_secs, duration_secs, track);
-    let playhead_x = time_to_x(*playhead_secs, duration_secs, track);
 
     if response.drag_started()
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        let part = if (pointer.x - start_x).abs() <= HANDLE_HIT_RADIUS {
-            DragPart::Start
-        } else if (pointer.x - end_x).abs() <= HANDLE_HIT_RADIUS {
-            DragPart::End
-        } else if (pointer.x - playhead_x).abs() <= HANDLE_HIT_RADIUS {
-            DragPart::Playhead
-        } else if pointer.x > start_x && pointer.x < end_x {
-            DragPart::Selection
-        } else {
-            DragPart::Playhead
-        };
+        let part = hit_test(pointer, start_x, end_x, track);
+        if matches!(part, DragPart::Playhead) {
+            *playhead_secs = x_to_time(pointer.x, duration_secs, track).min(max_preview_time);
+            response.mark_changed();
+        }
         ui.data_mut(|data| {
             data.insert_temp(
                 state_id,
@@ -68,7 +59,6 @@ pub fn show(
                     part,
                     start_secs: *start_secs,
                     end_secs: *end_secs,
-                    playhead_secs: *playhead_secs,
                 },
             );
         });
@@ -90,16 +80,10 @@ pub fn show(
                 *playhead_secs = (*end_secs - MIN_RANGE_SECS).max(0.0);
             }
             DragPart::Playhead => {
-                *playhead_secs = (state.playhead_secs + delta_secs).clamp(0.0, max_preview_time);
-            }
-            DragPart::Selection => {
-                let selection_duration = state.end_secs - state.start_secs;
-                let moved_start =
-                    (state.start_secs + delta_secs).clamp(0.0, duration_secs - selection_duration);
-                *start_secs = moved_start;
-                *end_secs = moved_start + selection_duration;
-                *playhead_secs = (state.playhead_secs + delta_secs)
-                    .clamp(*start_secs, (*end_secs).min(max_preview_time));
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    *playhead_secs =
+                        x_to_time(pointer.x, duration_secs, track).min(max_preview_time);
+                }
             }
         }
         response.mark_changed();
@@ -116,17 +100,20 @@ pub fn show(
     let end_x = time_to_x(*end_secs, duration_secs, track);
     let playhead_x = time_to_x(*playhead_secs, duration_secs, track);
 
-    let pointer_x = response.hover_pos().map(|pointer| pointer.x);
-    let over_handle = pointer_x.is_some_and(|x| {
-        (x - start_x).abs() <= HANDLE_HIT_RADIUS
-            || (x - end_x).abs() <= HANDLE_HIT_RADIUS
-            || (x - playhead_x).abs() <= HANDLE_HIT_RADIUS
+    let over_handle = response.hover_pos().is_some_and(|pointer| {
+        matches!(
+            hit_test(pointer, start_x, end_x, track),
+            DragPart::Start | DragPart::End
+        )
     });
     response = response.on_hover_cursor(if over_handle {
         CursorIcon::ResizeHorizontal
     } else {
-        CursorIcon::Grab
+        CursorIcon::PointingHand
     });
+    response = response.on_hover_text(
+        "Drag the violet handles to set start and end. Click or drag elsewhere to preview.",
+    );
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(track, 4.0, Color32::from_rgb(45, 50, 64));
@@ -149,19 +136,29 @@ pub fn show(
 
     paint_handle(&painter, start_x, track.center().y, response.dragged());
     paint_handle(&painter, end_x, track.center().y, response.dragged());
+    let playhead_top = rect.top() + 7.0;
     painter.line_segment(
         [
-            Pos2::new(playhead_x, track.top() - 13.0),
+            Pos2::new(playhead_x, playhead_top),
             Pos2::new(playhead_x, track.bottom() + 13.0),
         ],
         Stroke::new(2.0, Color32::WHITE),
     );
-    painter.circle_filled(
-        Pos2::new(playhead_x, track.top() - 13.0),
-        4.0,
-        Color32::WHITE,
-    );
+    painter.circle_filled(Pos2::new(playhead_x, playhead_top), 5.0, Color32::WHITE);
     response
+}
+
+fn hit_test(pointer: Pos2, start_x: f32, end_x: f32, track: Rect) -> DragPart {
+    // The white preview marker may share an x position with a trim handle. Its circle is
+    // in the upper lane, while the violet handles occupy the lower lane.
+    let in_handle_lane = pointer.y >= track.center().y - 14.0;
+    if in_handle_lane && (pointer.x - start_x).abs() <= HANDLE_HIT_RADIUS {
+        DragPart::Start
+    } else if in_handle_lane && (pointer.x - end_x).abs() <= HANDLE_HIT_RADIUS {
+        DragPart::End
+    } else {
+        DragPart::Playhead
+    }
 }
 
 fn time_to_x(seconds: f64, duration: f64, track: Rect) -> f32 {
@@ -190,4 +187,31 @@ fn paint_handle(painter: &egui::Painter, x: f32, center_y: f32, active: bool) {
         [Pos2::new(x, center_y - 6.0), Pos2::new(x, center_y + 6.0)],
         Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.75)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_preview_and_start_have_separate_hit_lanes() {
+        let track = Rect::from_min_max(Pos2::new(10.0, 30.0), Pos2::new(290.0, 38.0));
+        assert!(matches!(
+            hit_test(Pos2::new(10.0, 8.0), 10.0, 290.0, track),
+            DragPart::Playhead
+        ));
+        assert!(matches!(
+            hit_test(Pos2::new(10.0, 34.0), 10.0, 290.0, track),
+            DragPart::Start
+        ));
+    }
+
+    #[test]
+    fn timeline_background_drags_the_preview() {
+        let track = Rect::from_min_max(Pos2::new(10.0, 30.0), Pos2::new(290.0, 38.0));
+        assert!(matches!(
+            hit_test(Pos2::new(150.0, 34.0), 10.0, 290.0, track),
+            DragPart::Playhead
+        ));
+    }
 }
