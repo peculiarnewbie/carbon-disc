@@ -12,6 +12,13 @@ pub struct MediaInfo {
     pub streams: Vec<MediaStream>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 impl MediaInfo {
     #[must_use]
     pub fn video_stream(&self) -> Option<&MediaStream> {

@@ -15,7 +15,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    EncodeRequest, Error, MediaInfo, Result,
+    EncodeRequest, Error, MediaInfo, PreviewFrame, Result,
     model::{AudioEncoder, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
 };
 
@@ -146,6 +146,30 @@ impl FfmpegEngine {
         ]);
         args
     }
+
+    #[must_use]
+    pub fn preview_args(path: &Path, at_secs: f64, max_width: u32) -> Vec<OsString> {
+        vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-ss".into(),
+            format!("{at_secs:.3}").into(),
+            "-i".into(),
+            path.as_os_str().into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-an".into(),
+            "-sn".into(),
+            "-vf".into(),
+            format!("scale={}:-2", max_width.max(16)).into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-vcodec".into(),
+            "png".into(),
+            "pipe:1".into(),
+        ]
+    }
 }
 
 impl MediaEngine for FfmpegEngine {
@@ -176,6 +200,34 @@ impl MediaEngine for FfmpegEngine {
             });
         }
         parse_probe(path, &output.stdout)
+    }
+
+    fn preview(&self, path: &Path, at_secs: f64, max_width: u32) -> Result<PreviewFrame> {
+        if !at_secs.is_finite() || at_secs < 0.0 {
+            return Err(Error::InvalidRequest(
+                "preview position must be a positive time".into(),
+            ));
+        }
+        let output = Command::new(&self.ffmpeg)
+            .args(Self::preview_args(path, at_secs, max_width))
+            .output()
+            .map_err(|source| Error::Launch {
+                program: self.ffmpeg.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(Error::Process {
+                program: self.ffmpeg.display().to_string(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let image = image::load_from_memory(&output.stdout)?.into_rgba8();
+        let (width, height) = image.dimensions();
+        Ok(PreviewFrame {
+            width,
+            height,
+            rgba: image.into_raw(),
+        })
     }
 
     fn encode(
@@ -410,6 +462,14 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.500"]));
         assert!(args.windows(2).any(|pair| pair == ["-t", "30.250"]));
         assert_eq!(request.output_duration_secs(), 30.25);
+    }
+
+    #[test]
+    fn preview_is_a_single_scaled_png_frame() {
+        let args = FfmpegEngine::preview_args(Path::new("source movie.mkv"), 12.3456, 640);
+        assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
+        assert!(args.windows(2).any(|pair| pair == ["-vf", "scale=640:-2"]));
+        assert!(args.windows(2).any(|pair| pair == ["-vcodec", "png"]));
     }
 
     #[test]

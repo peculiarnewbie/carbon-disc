@@ -9,6 +9,7 @@ const HANDLE_HIT_RADIUS: f32 = 12.0;
 enum DragPart {
     Start,
     End,
+    Playhead,
     Selection,
 }
 
@@ -17,6 +18,7 @@ struct DragState {
     part: DragPart,
     start_secs: f64,
     end_secs: f64,
+    playhead_secs: f64,
 }
 
 /// A two-handled timeline brush. Drag either edge to trim, or drag the highlighted
@@ -25,6 +27,7 @@ pub fn show(
     ui: &mut egui::Ui,
     start_secs: &mut f64,
     end_secs: &mut f64,
+    playhead_secs: &mut f64,
     duration_secs: f64,
 ) -> Response {
     let desired_size = Vec2::new(ui.available_width().max(120.0), 42.0);
@@ -37,9 +40,12 @@ pub fn show(
 
     *start_secs = start_secs.clamp(0.0, (duration_secs - MIN_RANGE_SECS).max(0.0));
     *end_secs = end_secs.clamp(*start_secs + MIN_RANGE_SECS, duration_secs);
+    let max_preview_time = (duration_secs - MIN_RANGE_SECS).max(0.0);
+    *playhead_secs = playhead_secs.clamp(0.0, max_preview_time);
 
     let start_x = time_to_x(*start_secs, duration_secs, track);
     let end_x = time_to_x(*end_secs, duration_secs, track);
+    let playhead_x = time_to_x(*playhead_secs, duration_secs, track);
 
     if response.drag_started()
         && let Some(pointer) = response.interact_pointer_pos()
@@ -48,12 +54,12 @@ pub fn show(
             DragPart::Start
         } else if (pointer.x - end_x).abs() <= HANDLE_HIT_RADIUS {
             DragPart::End
+        } else if (pointer.x - playhead_x).abs() <= HANDLE_HIT_RADIUS {
+            DragPart::Playhead
         } else if pointer.x > start_x && pointer.x < end_x {
             DragPart::Selection
-        } else if (pointer.x - start_x).abs() < (pointer.x - end_x).abs() {
-            DragPart::Start
         } else {
-            DragPart::End
+            DragPart::Playhead
         };
         ui.data_mut(|data| {
             data.insert_temp(
@@ -62,6 +68,7 @@ pub fn show(
                     part,
                     start_secs: *start_secs,
                     end_secs: *end_secs,
+                    playhead_secs: *playhead_secs,
                 },
             );
         });
@@ -75,10 +82,15 @@ pub fn show(
             DragPart::Start => {
                 *start_secs =
                     (state.start_secs + delta_secs).clamp(0.0, state.end_secs - MIN_RANGE_SECS);
+                *playhead_secs = *start_secs;
             }
             DragPart::End => {
                 *end_secs = (state.end_secs + delta_secs)
                     .clamp(state.start_secs + MIN_RANGE_SECS, duration_secs);
+                *playhead_secs = (*end_secs - MIN_RANGE_SECS).max(0.0);
+            }
+            DragPart::Playhead => {
+                *playhead_secs = (state.playhead_secs + delta_secs).clamp(0.0, max_preview_time);
             }
             DragPart::Selection => {
                 let selection_duration = state.end_secs - state.start_secs;
@@ -86,14 +98,29 @@ pub fn show(
                     (state.start_secs + delta_secs).clamp(0.0, duration_secs - selection_duration);
                 *start_secs = moved_start;
                 *end_secs = moved_start + selection_duration;
+                *playhead_secs = (state.playhead_secs + delta_secs)
+                    .clamp(*start_secs, (*end_secs).min(max_preview_time));
             }
         }
         response.mark_changed();
     }
 
+    if response.clicked()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *playhead_secs = x_to_time(pointer.x, duration_secs, track).min(max_preview_time);
+        response.mark_changed();
+    }
+
+    let start_x = time_to_x(*start_secs, duration_secs, track);
+    let end_x = time_to_x(*end_secs, duration_secs, track);
+    let playhead_x = time_to_x(*playhead_secs, duration_secs, track);
+
     let pointer_x = response.hover_pos().map(|pointer| pointer.x);
     let over_handle = pointer_x.is_some_and(|x| {
-        (x - start_x).abs() <= HANDLE_HIT_RADIUS || (x - end_x).abs() <= HANDLE_HIT_RADIUS
+        (x - start_x).abs() <= HANDLE_HIT_RADIUS
+            || (x - end_x).abs() <= HANDLE_HIT_RADIUS
+            || (x - playhead_x).abs() <= HANDLE_HIT_RADIUS
     });
     response = response.on_hover_cursor(if over_handle {
         CursorIcon::ResizeHorizontal
@@ -122,6 +149,18 @@ pub fn show(
 
     paint_handle(&painter, start_x, track.center().y, response.dragged());
     paint_handle(&painter, end_x, track.center().y, response.dragged());
+    painter.line_segment(
+        [
+            Pos2::new(playhead_x, track.top() - 13.0),
+            Pos2::new(playhead_x, track.bottom() + 13.0),
+        ],
+        Stroke::new(2.0, Color32::WHITE),
+    );
+    painter.circle_filled(
+        Pos2::new(playhead_x, track.top() - 13.0),
+        4.0,
+        Color32::WHITE,
+    );
     response
 }
 
@@ -132,6 +171,11 @@ fn time_to_x(seconds: f64, duration: f64, track: Rect) -> f32 {
         0.0
     };
     egui::lerp(track.x_range(), fraction)
+}
+
+fn x_to_time(x: f32, duration: f64, track: Rect) -> f64 {
+    let fraction = ((x - track.left()) / track.width()).clamp(0.0, 1.0);
+    f64::from(fraction) * duration
 }
 
 fn paint_handle(painter: &egui::Painter, x: f32, center_y: f32, active: bool) {

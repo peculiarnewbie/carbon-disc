@@ -8,7 +8,7 @@ use std::{
     thread,
 };
 
-use crate::{EncodeRequest, MediaEngine, MediaInfo, engine::EngineEvent};
+use crate::{EncodeRequest, MediaEngine, MediaInfo, PreviewFrame, engine::EngineEvent};
 
 pub type JobId = u64;
 type ActiveJob = (JobId, Arc<AtomicBool>, Receiver<(JobId, crate::Result<()>)>);
@@ -35,6 +35,10 @@ pub enum JobState {
 #[derive(Debug)]
 pub enum Command {
     Probe(std::path::PathBuf),
+    Preview {
+        path: std::path::PathBuf,
+        at_secs: f64,
+    },
     Add(EncodeRequest),
     Remove(JobId),
     Start,
@@ -47,6 +51,11 @@ pub enum Command {
 pub enum Event {
     ProbeStarted,
     ProbeFinished(Result<MediaInfo, String>),
+    PreviewStarted(f64),
+    PreviewFinished {
+        at_secs: f64,
+        result: Result<PreviewFrame, String>,
+    },
     Snapshot(Vec<JobSnapshot>),
     Backend(String),
 }
@@ -125,6 +134,13 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 let _ = events.send(Event::ProbeStarted);
                 let result = engine.probe(&path).map_err(|error| error.to_string());
                 let _ = events.send(Event::ProbeFinished(result));
+            }
+            Command::Preview { path, at_secs } => {
+                let _ = events.send(Event::PreviewStarted(at_secs));
+                let result = engine
+                    .preview(&path, at_secs, 640)
+                    .map_err(|error| error.to_string());
+                let _ = events.send(Event::PreviewFinished { at_secs, result });
             }
             Command::Add(request) => {
                 jobs.push_back(JobSnapshot {

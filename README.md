@@ -4,9 +4,9 @@ Carbon Disc is an open-source desktop video transcoder written in Rust and power
 FFmpeg. It aims for HandBrake's approachable workflow while keeping the media backend
 behind a small, testable Rust interface.
 
-> Early development: probing, presets, start/end range cutting, queueing, progress,
-> cancellation, and FFmpeg transcoding are implemented. Track selection, subtitles,
-> filters, previews, and persisted presets are planned next.
+> Early development: probing, frame previews, presets, start/end range cutting,
+> queueing, progress, cancellation, and FFmpeg transcoding are implemented. Track
+> selection, subtitles, filters, and persisted presets are planned next.
 
 ## Architecture
 

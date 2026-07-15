@@ -12,6 +12,8 @@ pub enum Error {
     Process { program: String, message: String },
     #[error("invalid media metadata: {0}")]
     InvalidMetadata(#[from] serde_json::Error),
+    #[error("invalid preview image: {0}")]
+    InvalidImage(#[from] image::ImageError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("encode was cancelled")]

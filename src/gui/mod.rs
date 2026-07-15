@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Color32, RichText};
@@ -26,6 +27,11 @@ pub struct App {
     output: String,
     trim_start_secs: f64,
     trim_end_secs: f64,
+    preview_at_secs: f64,
+    preview_texture: Option<egui::TextureHandle>,
+    preview_loading: bool,
+    preview_error: Option<String>,
+    preview_due: Option<Instant>,
     jobs: Vec<JobSnapshot>,
     selected_job: Option<u64>,
 }
@@ -50,6 +56,11 @@ impl App {
             output: String::new(),
             trim_start_secs: 0.0,
             trim_end_secs: 0.0,
+            preview_at_secs: 0.0,
+            preview_texture: None,
+            preview_loading: false,
+            preview_error: None,
+            preview_due: None,
             jobs: Vec::new(),
             selected_job: None,
         }
@@ -62,6 +73,9 @@ impl App {
                 Event::ProbeStarted => {
                     self.probing = true;
                     self.probe_error = None;
+                    self.preview_texture = None;
+                    self.preview_error = None;
+                    self.preview_due = None;
                 }
                 Event::ProbeFinished(result) => {
                     self.probing = false;
@@ -69,12 +83,39 @@ impl App {
                         Ok(media) => {
                             self.trim_start_secs = 0.0;
                             self.trim_end_secs = media.duration_secs;
+                            self.preview_at_secs = 0.0;
+                            self.preview_due = Some(Instant::now());
                             self.output = suggested_output(&media.path, self.settings.container)
                                 .display()
                                 .to_string();
                             self.media = Some(media);
                         }
                         Err(error) => self.probe_error = Some(error),
+                    }
+                }
+                Event::PreviewStarted(at_secs) => {
+                    if (at_secs - self.preview_at_secs).abs() < 0.051 {
+                        self.preview_loading = true;
+                    }
+                }
+                Event::PreviewFinished { at_secs, result } => {
+                    self.preview_loading = false;
+                    if (at_secs - self.preview_at_secs).abs() < 0.051 {
+                        match result {
+                            Ok(frame) => {
+                                let image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [frame.width as usize, frame.height as usize],
+                                    &frame.rgba,
+                                );
+                                self.preview_texture = Some(context.load_texture(
+                                    "source_preview",
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                                self.preview_error = None;
+                            }
+                            Err(error) => self.preview_error = Some(error),
+                        }
                     }
                 }
                 Event::Snapshot(snapshot) => self.merge_snapshot(snapshot),
@@ -125,6 +166,24 @@ impl App {
             self.coordinator.send(Command::Add(request));
         }
     }
+
+    fn schedule_preview(&mut self) {
+        self.preview_due = Some(Instant::now() + Duration::from_millis(180));
+    }
+
+    fn dispatch_preview_if_due(&mut self) {
+        if self.preview_loading || self.preview_due.is_none_or(|due| due > Instant::now()) {
+            return;
+        }
+        self.preview_due = None;
+        if let Some(media) = &self.media {
+            self.preview_loading = true;
+            self.coordinator.send(Command::Preview {
+                path: media.path.clone(),
+                at_secs: self.preview_at_secs,
+            });
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -132,6 +191,7 @@ impl eframe::App for App {
         let context = root.ctx().clone();
         context.request_repaint_after(std::time::Duration::from_millis(50));
         self.poll(&context);
+        self.dispatch_preview_if_due();
         egui::Panel::top("toolbar")
             .frame(
                 egui::Frame::new()
@@ -202,7 +262,9 @@ impl eframe::App for App {
                     .fill(theme::WINDOW)
                     .inner_margin(egui::Margin::same(18)),
             )
-            .show(root, |ui| self.settings_ui(ui));
+            .show(root, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui));
+            });
         if self.probing {
             egui::Window::new("Reading source")
                 .collapsible(false)
@@ -386,43 +448,95 @@ impl App {
                                 if ui.small_button("Reset to full video").clicked() {
                                     self.trim_start_secs = 0.0;
                                     self.trim_end_secs = source_duration;
+                                    self.preview_at_secs = 0.0;
+                                    self.schedule_preview();
                                 }
                             },
                         );
                     });
                     ui.add_space(4.0);
-                    range_brush::show(
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Preview · {}",
+                                format_timecode(self.preview_at_secs, true)
+                            ))
+                            .strong(),
+                        );
+                        if self.preview_loading {
+                            ui.spinner();
+                            ui.label(RichText::new("Loading frame…").color(theme::MUTED));
+                        }
+                    });
+                    if let Some(texture) = &self.preview_texture {
+                        ui.vertical_centered(|ui| {
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .max_size(egui::vec2(ui.available_width(), 240.0))
+                                    .corner_radius(6),
+                            );
+                        });
+                    } else if !self.preview_loading {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 120.0),
+                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("Scrub the timeline to preview a frame")
+                                        .color(theme::MUTED),
+                                );
+                            },
+                        );
+                    }
+                    if let Some(error) = &self.preview_error {
+                        ui.colored_label(theme::RED, error);
+                    }
+                    let brush_response = range_brush::show(
                         ui,
                         &mut self.trim_start_secs,
                         &mut self.trim_end_secs,
+                        &mut self.preview_at_secs,
                         source_duration,
                     );
+                    if brush_response.changed() {
+                        self.schedule_preview();
+                    }
+                    let mut precise_preview = None;
                     egui::Grid::new("encode_range")
                         .num_columns(4)
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
                             ui.label("Start");
-                            ui.add(
+                            if ui.add(
                                 egui::DragValue::new(&mut self.trim_start_secs)
                                     .range(0.0..=(self.trim_end_secs - 0.1).max(0.0))
                                     .speed(0.1)
                                     .suffix(" s"),
-                            );
+                            ).changed() {
+                                precise_preview = Some(self.trim_start_secs);
+                            }
                             ui.monospace(format_timecode(self.trim_start_secs, true));
                             ui.label(RichText::new("drag left handle").small().color(theme::MUTED));
                             ui.end_row();
 
                             ui.label("End");
-                            ui.add(
+                            if ui.add(
                                 egui::DragValue::new(&mut self.trim_end_secs)
                                     .range((self.trim_start_secs + 0.1)..=source_duration)
                                     .speed(0.1)
                                     .suffix(" s"),
-                            );
+                            ).changed() {
+                                precise_preview = Some(self.trim_end_secs);
+                            }
                             ui.monospace(format_timecode(self.trim_end_secs, true));
                             ui.label(RichText::new("drag right handle").small().color(theme::MUTED));
                             ui.end_row();
                         });
+                    if let Some(at_secs) = precise_preview {
+                        self.preview_at_secs =
+                            at_secs.min((source_duration - 0.1).max(0.0));
+                        self.schedule_preview();
+                    }
                     ui.label(
                         RichText::new(
                             "Start and end are preserved with the queued job, so you can queue multiple clips from one source.",

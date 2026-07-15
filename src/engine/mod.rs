@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use crate::{EncodeRequest, MediaInfo, Result};
+use crate::{EncodeRequest, MediaInfo, PreviewFrame, Result};
 
 pub mod ffmpeg;
 
@@ -22,6 +22,7 @@ pub enum EngineEvent {
 pub trait MediaEngine: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn probe(&self, path: &Path) -> Result<MediaInfo>;
+    fn preview(&self, path: &Path, at_secs: f64, max_width: u32) -> Result<PreviewFrame>;
     fn encode(
         &self,
         request: &EncodeRequest,
