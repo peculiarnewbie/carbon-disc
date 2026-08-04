@@ -392,10 +392,10 @@ impl eframe::App for App {
                 }
             });
 
-        egui::Panel::bottom("queue")
+        egui::Panel::right("queue")
             .resizable(true)
-            .default_size(190.0)
-            .min_size(120.0)
+            .default_size(320.0)
+            .min_size(240.0)
             .frame(panel_frame())
             .show(root, |ui| self.queue_ui(ui));
         egui::Panel::left("source")

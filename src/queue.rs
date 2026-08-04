@@ -176,6 +176,9 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
                 active = None;
                 persist_jobs(&jobs, &events);
+                if !jobs.iter().any(|job| job.state == JobState::Queued) {
+                    processing = false;
+                }
             } else {
                 let _ = (id, cancelled);
             }
