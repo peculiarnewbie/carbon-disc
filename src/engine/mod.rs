@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use crate::{EncodeRequest, EngineCapabilities, MediaInfo, PreviewFrame, Result};
+use crate::{CropMargins, EncodeRequest, EngineCapabilities, MediaInfo, PreviewFrame, Result};
 
 pub mod ffmpeg;
 
@@ -31,6 +31,15 @@ pub trait MediaEngine: Send + Sync + 'static {
         fast_seek: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<PreviewFrame>;
+    /// Finds black bars by sampling frames across the source. Returns the largest crop
+    /// that is safe for every sample, so bright scenes are never cut.
+    fn detect_crop(
+        &self,
+        path: &Path,
+        duration_secs: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<CropMargins>;
     fn encode(
         &self,
         request: &EncodeRequest,

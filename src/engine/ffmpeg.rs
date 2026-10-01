@@ -15,7 +15,7 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame, Result,
+    CropMargins, EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame, Result,
     model::{AudioEncoder, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
 };
 
@@ -224,6 +224,27 @@ impl FfmpegEngine {
     }
 
     #[must_use]
+    pub fn crop_detect_args(path: &Path, at_secs: f64) -> Vec<OsString> {
+        vec![
+            "-hide_banner".into(),
+            "-ss".into(),
+            format!("{:.3}", at_secs.max(0.0)).into(),
+            "-i".into(),
+            path.as_os_str().into(),
+            "-frames:v".into(),
+            "8".into(),
+            "-an".into(),
+            "-sn".into(),
+            "-dn".into(),
+            "-vf".into(),
+            "cropdetect=limit=24:round=2:reset=0".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ]
+    }
+
+    #[must_use]
     pub fn preview_args(
         path: &Path,
         at_secs: f64,
@@ -429,6 +450,39 @@ impl MediaEngine for FfmpegEngine {
             });
         }
         parse_ppm(&stdout)
+    }
+
+    fn detect_crop(
+        &self,
+        path: &Path,
+        duration_secs: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<CropMargins> {
+        let mut combined: Option<CropMargins> = None;
+        for fraction in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            let output = Command::new(&self.ffmpeg)
+                .args(Self::crop_detect_args(path, duration_secs * fraction))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|source| Error::Launch {
+                    program: self.ffmpeg.clone(),
+                    source,
+                })?;
+            let log = String::from_utf8_lossy(&output.stderr);
+            // Fully black frames report nonsense crops and are skipped.
+            if let Some(sample) = parse_cropdetect(&log, width, height) {
+                combined = Some(combined.map_or(sample, |crop| CropMargins {
+                    top: crop.top.min(sample.top),
+                    bottom: crop.bottom.min(sample.bottom),
+                    left: crop.left.min(sample.left),
+                    right: crop.right.min(sample.right),
+                }));
+            }
+        }
+        Ok(combined.unwrap_or(CropMargins::ZERO))
     }
 
     fn encode(
@@ -760,6 +814,37 @@ fn tag(tags: &Option<HashMap<String, String>>, key: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// Reads the last `crop=w:h:x:y` that FFmpeg's cropdetect filter logged.
+fn parse_cropdetect(log: &str, width: u32, height: u32) -> Option<CropMargins> {
+    let values = log.lines().rev().find_map(|line| {
+        let crop = line.split("crop=").nth(1)?.split_whitespace().next()?;
+        let values: Vec<i64> = crop
+            .split(':')
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        (values.len() == 4).then_some(values)
+    })?;
+    let (crop_width, crop_height, x, y) = (values[0], values[1], values[2], values[3]);
+    let (width, height) = (i64::from(width), i64::from(height));
+    if crop_width <= 0
+        || crop_height <= 0
+        || x < 0
+        || y < 0
+        || x + crop_width > width
+        || y + crop_height > height
+    {
+        return None;
+    }
+    let even = |value: i64| u32::try_from(value).unwrap_or(0) & !1;
+    Some(CropMargins {
+        top: even(y),
+        bottom: even(height - crop_height - y),
+        left: even(x),
+        right: even(width - crop_width - x),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1049,22 @@ mod tests {
                 speed: Some(2.5)
             }
         );
+    }
+
+    #[test]
+    fn cropdetect_output_becomes_margins() {
+        let log = "[Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:138 y2:941 w:1920 h:800 x:0 y:140 pts:1 t:0.04 crop=1920:800:0:140\n\
+                   [Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:138 y2:941 w:1920 h:800 x:0 y:140 pts:2 t:0.08 crop=1920:800:0:140\n";
+        assert_eq!(
+            parse_cropdetect(log, 1920, 1080),
+            Some(CropMargins {
+                top: 140,
+                bottom: 140,
+                left: 0,
+                right: 0
+            })
+        );
+        let black = "[Parsed_cropdetect_0 @ 0x1] crop=-1904:-1072:1912:1080\n";
+        assert_eq!(parse_cropdetect(black, 1920, 1080), None);
     }
 }

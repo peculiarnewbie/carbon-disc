@@ -37,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Carbon Disc")
-            .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_inner_size([1360.0, 900.0])
+            .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(

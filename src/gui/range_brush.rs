@@ -113,7 +113,7 @@ pub fn show(
         CursorIcon::PointingHand
     });
     response = response.on_hover_text(
-        "Drag the violet handles to set start and end. Click or drag elsewhere to preview.",
+        "Drag the violet handles to trim. Click or drag elsewhere to preview.\n⬅ / ➡ step 1 s (hold Shift for 10 s) · I / O set start / end",
     );
 
     let painter = ui.painter_at(rect);

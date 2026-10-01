@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{CustomPreset, EncodeRequest, Error, Result};
+use crate::{CustomPreset, EncodeRequest, EncodeSettings, Error, Result, model::Preset};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -17,6 +17,41 @@ struct PresetDocument {
 struct QueueDocument {
     version: u32,
     jobs: Vec<EncodeRequest>,
+}
+
+/// Choices the GUI restores on the next launch so a regular workflow needs no setup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Session {
+    pub settings: EncodeSettings,
+    pub preset: Preset,
+    pub custom_preset: Option<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionDocument {
+    version: u32,
+    session: Session,
+}
+
+pub fn load_session() -> Result<Option<Session>> {
+    let path = data_path("session.json")?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let document: SessionDocument = read_json(&path)?;
+    validate_version(document.version)?;
+    Ok(Some(document.session))
+}
+
+pub fn save_session(session: &Session) -> Result<()> {
+    write_json(
+        &data_path("session.json")?,
+        &SessionDocument {
+            version: SCHEMA_VERSION,
+            session: session.clone(),
+        },
+    )
 }
 
 pub fn load_presets() -> Result<Vec<CustomPreset>> {

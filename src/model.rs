@@ -110,6 +110,17 @@ impl EncodeRequest {
                 "crop margins remove the entire picture".into(),
             ));
         }
+        if !self
+            .settings
+            .container
+            .supports_video(self.settings.video_encoder)
+        {
+            return Err(crate::Error::InvalidRequest(format!(
+                "{} cannot hold {} video",
+                self.settings.container.display_name(),
+                self.settings.video_encoder.display_name()
+            )));
+        }
         if self.settings.max_width == Some(0) || self.settings.max_height == Some(0) {
             return Err(crate::Error::InvalidRequest(
                 "output dimensions must be greater than zero".into(),
@@ -121,6 +132,13 @@ impl EncodeRequest {
                 return Err(crate::Error::InvalidRequest(format!(
                     "audio stream {} was selected more than once",
                     track.source_index
+                )));
+            }
+            if !self.settings.container.supports_audio(track.encoder) {
+                return Err(crate::Error::InvalidRequest(format!(
+                    "{} cannot hold {} audio",
+                    self.settings.container.display_name(),
+                    track.encoder.display_name()
                 )));
             }
             if track.encoder != AudioEncoder::Copy && track.bitrate_kbps == 0 {
@@ -252,6 +270,39 @@ pub enum Container {
 }
 
 impl Container {
+    pub const ALL: [Self; 3] = [Self::Mp4, Self::Matroska, Self::WebM];
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Mp4 => "MP4",
+            Self::Matroska => "MKV",
+            Self::WebM => "WebM",
+        }
+    }
+
+    /// WebM is restricted to royalty-free codecs; MP4 and Matroska accept everything we encode.
+    #[must_use]
+    pub const fn supports_video(self, encoder: VideoEncoder) -> bool {
+        match self {
+            Self::WebM => matches!(
+                encoder,
+                VideoEncoder::Vp9
+                    | VideoEncoder::Av1
+                    | VideoEncoder::NvencAv1
+                    | VideoEncoder::QsvAv1
+                    | VideoEncoder::AmfAv1
+                    | VideoEncoder::VaapiAv1
+            ),
+            Self::Mp4 | Self::Matroska => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_audio(self, encoder: AudioEncoder) -> bool {
+        !matches!((self, encoder), (Self::WebM, AudioEncoder::Aac))
+    }
+
     #[must_use]
     pub const fn extension(self) -> &'static str {
         match self {
@@ -354,6 +405,23 @@ impl VideoEncoder {
         }
     }
 
+    /// The quality scale the encoder's rate control accepts.
+    #[must_use]
+    pub const fn quality_range(self) -> std::ops::RangeInclusive<u8> {
+        match self {
+            Self::Av1 | Self::Vp9 => 0..=63,
+            Self::VideoToolboxH264 | Self::VideoToolboxH265 => 1..=100,
+            _ => 0..=51,
+        }
+    }
+
+    /// VideoToolbox uses a 1–100 scale where higher is better; everything else is a
+    /// CRF/QP-style scale where lower is better.
+    #[must_use]
+    pub const fn higher_quality_is_better(self) -> bool {
+        matches!(self, Self::VideoToolboxH264 | Self::VideoToolboxH265)
+    }
+
     #[must_use]
     pub const fn is_hardware(self) -> bool {
         !matches!(self, Self::H264 | Self::H265 | Self::Av1 | Self::Vp9)
@@ -372,11 +440,37 @@ pub enum AudioEncoder {
     Copy,
 }
 
+impl AudioEncoder {
+    pub const ALL: [Self; 3] = [Self::Aac, Self::Opus, Self::Copy];
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Aac => "AAC",
+            Self::Opus => "Opus",
+            Self::Copy => "Passthrough",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EncoderSpeed {
     Fast,
     Balanced,
     Quality,
+}
+
+impl EncoderSpeed {
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Balanced, Self::Quality];
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Quality => "Slow",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -500,6 +594,31 @@ mod tests {
             settings: EncodeSettings::default(),
         };
         request.settings.crop.left = 1920;
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_codecs_the_container_cannot_hold() {
+        let mut request = EncodeRequest {
+            input: "source.mkv".into(),
+            output: "clip.webm".into(),
+            source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            overwrite: false,
+            settings: EncodeSettings::default(),
+        };
+        request.settings.container = Container::WebM;
+        assert!(request.validate().is_err());
+        request.settings.video_encoder = VideoEncoder::Vp9;
+        assert!(request.validate().is_ok());
+        request.audio_tracks.push(AudioTrackSettings {
+            source_index: 1,
+            encoder: AudioEncoder::Aac,
+            bitrate_kbps: 160,
+        });
         assert!(request.validate().is_err());
     }
 }

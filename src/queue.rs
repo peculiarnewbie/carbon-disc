@@ -45,6 +45,12 @@ pub enum Command {
         at_secs: f64,
         fast_seek: bool,
     },
+    DetectCrop {
+        path: PathBuf,
+        duration_secs: f64,
+        width: u32,
+        height: u32,
+    },
     BatchFiles {
         paths: Vec<PathBuf>,
         settings: EncodeSettings,
@@ -75,6 +81,7 @@ pub enum Event {
         result: Result<PreviewFrame, String>,
     },
     Capabilities(Result<EngineCapabilities, String>),
+    CropDetected(Result<crate::CropMargins, String>),
     BatchProgress {
         current: usize,
         total: usize,
@@ -215,13 +222,28 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 let _ = events.send(Event::PreviewStarted { id, at_secs });
                 thread::spawn(move || {
                     let result = preview_engine
-                        .preview(&path, at_secs, 640, fast_seek, cancelled)
+                        .preview(&path, at_secs, 1280, fast_seek, cancelled)
                         .map_err(|error| error.to_string());
                     let _ = preview_events.send(Event::PreviewFinished {
                         id,
                         at_secs,
                         result,
                     });
+                });
+            }
+            Command::DetectCrop {
+                path,
+                duration_secs,
+                width,
+                height,
+            } => {
+                let crop_engine = engine.clone();
+                let crop_events = events.clone();
+                thread::spawn(move || {
+                    let result = crop_engine
+                        .detect_crop(&path, duration_secs, width, height)
+                        .map_err(|error| error.to_string());
+                    let _ = crop_events.send(Event::CropDetected(result));
                 });
             }
             Command::BatchFiles { paths, settings } => {
@@ -434,7 +456,7 @@ fn restored_state(request: &EncodeRequest) -> (JobState, Option<String>) {
         (
             JobState::Failed,
             Some(format!(
-                "Destination already exists: {}. Remove and re-add this job to confirm replacement.",
+                "Destination already exists: {}. Use Retry to confirm replacing it.",
                 request.output.display()
             )),
         )

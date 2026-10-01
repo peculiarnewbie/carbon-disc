@@ -8,14 +8,59 @@ use std::{
 use eframe::egui::{self, Color32, RichText};
 
 use crate::{
-    AudioTrackSettings, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
+    AudioTrackSettings, CropMargins, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
     engine::ffmpeg::FfmpegEngine,
-    model::{AudioEncoder, Container, EngineCapabilities, MediaInfo, Preset},
-    queue::{Command, Coordinator, Event, JobSnapshot, JobState},
+    model::{
+        AudioEncoder, Container, EncoderSpeed, EngineCapabilities, MediaInfo, Preset, VideoEncoder,
+    },
+    persistence::Session,
+    queue::{Command, Coordinator, Event, JobId, JobSnapshot, JobState},
 };
 
+mod crop_editor;
 mod range_brush;
 pub mod theme;
+mod widgets;
+
+use widgets::Icon;
+
+const VIDEO_EXTENSIONS: [&str; 10] = [
+    "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mts", "m2ts", "mpg",
+];
+const RESOLUTION_LIMITS: [(&str, u32, u32); 5] = [
+    ("2160p (4K)", 3840, 2160),
+    ("1440p", 2560, 1440),
+    ("1080p", 1920, 1080),
+    ("720p", 1280, 720),
+    ("480p", 854, 480),
+];
+const AUDIO_BITRATES: [u16; 9] = [64, 96, 128, 160, 192, 256, 320, 384, 512];
+const PRIMARY_BUTTON_SIZE: egui::Vec2 = egui::vec2(150.0, 34.0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Video,
+    Audio,
+    Picture,
+}
+
+enum Status {
+    Info(String),
+    Error(String),
+}
+
+/// A job waiting on the "replace existing file?" confirmation.
+struct PendingAdd {
+    request: EncodeRequest,
+    start: bool,
+    replaces: Option<JobId>,
+}
+
+enum JobAction {
+    Remove(JobId),
+    Retry(JobId),
+    Reveal(PathBuf),
+}
 
 pub struct App {
     coordinator: Coordinator,
@@ -25,7 +70,10 @@ pub struct App {
     probe_error: Option<String>,
     settings: EncodeSettings,
     preset: Preset,
+    selected_custom_preset: Option<String>,
+    custom_presets: Vec<CustomPreset>,
     output: String,
+    output_dir: Option<PathBuf>,
     trim_start_secs: f64,
     trim_end_secs: f64,
     preview_at_secs: f64,
@@ -37,18 +85,19 @@ pub struct App {
     next_preview_id: u64,
     active_preview_id: Option<u64>,
     selected_audio_tracks: BTreeSet<u32>,
-    pending_overwrite: Option<EncodeRequest>,
-    request_error: Option<String>,
+    pending_add: Option<PendingAdd>,
+    status: Option<Status>,
     jobs: Vec<JobSnapshot>,
-    selected_job: Option<u64>,
     capabilities: Option<EngineCapabilities>,
     capability_error: Option<String>,
-    custom_presets: Vec<CustomPreset>,
-    selected_custom_preset: Option<String>,
+    detecting_crop: bool,
     show_save_preset: bool,
     preset_name_input: String,
     preset_description_input: String,
-    batch_status: Option<String>,
+    tab: Tab,
+    confirm_close: bool,
+    allow_close: bool,
+    window_title: String,
 }
 
 impl App {
@@ -60,22 +109,43 @@ impl App {
         if let Some(path) = initial_path {
             coordinator.send(Command::Probe(path));
         }
-        let (custom_presets, request_error) = match crate::persistence::load_presets() {
-            Ok(presets) => (presets, None),
-            Err(error) => (
-                Vec::new(),
-                Some(format!("Could not load custom presets: {error}")),
-            ),
-        };
+        let mut status = None;
+        let custom_presets = crate::persistence::load_presets().unwrap_or_else(|error| {
+            status = Some(Status::Error(format!(
+                "Could not load custom presets: {error}"
+            )));
+            Vec::new()
+        });
+        let session = crate::persistence::load_session().unwrap_or_else(|error| {
+            status = Some(Status::Error(format!(
+                "Could not restore last session: {error}"
+            )));
+            None
+        });
+        let session = session.unwrap_or_else(|| Session {
+            settings: Preset::Balanced.settings(),
+            preset: Preset::Balanced,
+            custom_preset: None,
+            output_dir: None,
+        });
+        let mut settings = session.settings;
+        // Crop belongs to a particular source, so it never carries over between launches.
+        settings.crop = CropMargins::ZERO;
+        let selected_custom_preset = session
+            .custom_preset
+            .filter(|name| custom_presets.iter().any(|preset| &preset.name == name));
         Self {
             coordinator,
             backend: "Detecting backend…".into(),
             media: None,
             probing,
             probe_error: None,
-            settings: Preset::Balanced.settings(),
-            preset: Preset::Balanced,
+            settings,
+            preset: session.preset,
+            selected_custom_preset,
+            custom_presets,
             output: String::new(),
+            output_dir: session.output_dir,
             trim_start_secs: 0.0,
             trim_end_secs: 0.0,
             preview_at_secs: 0.0,
@@ -87,18 +157,19 @@ impl App {
             next_preview_id: 1,
             active_preview_id: None,
             selected_audio_tracks: BTreeSet::new(),
-            pending_overwrite: None,
-            request_error,
+            pending_add: None,
+            status,
             jobs: Vec::new(),
-            selected_job: None,
             capabilities: None,
             capability_error: None,
-            custom_presets,
-            selected_custom_preset: None,
+            detecting_crop: false,
             show_save_preset: false,
             preset_name_input: String::new(),
             preset_description_input: String::new(),
-            batch_status: None,
+            tab: Tab::Video,
+            confirm_close: false,
+            allow_close: false,
+            window_title: String::new(),
         }
     }
 
@@ -129,7 +200,10 @@ impl App {
                             self.preview_at_secs = 0.0;
                             self.preview_fast_seek = false;
                             self.preview_due = Some(Instant::now());
-                            self.output = suggested_output(&media.path, self.settings.container)
+                            self.settings.crop = CropMargins::ZERO;
+                            self.detecting_crop = false;
+                            self.output = self
+                                .suggested_output(&media.path, None)
                                 .display()
                                 .to_string();
                             self.media = Some(media);
@@ -174,6 +248,26 @@ impl App {
                         }
                     }
                 }
+                Event::CropDetected(result) => {
+                    self.detecting_crop = false;
+                    match result {
+                        Ok(crop) if crop.is_zero() => {
+                            self.status = Some(Status::Info("No black bars found".into()));
+                        }
+                        Ok(crop) => {
+                            self.settings.crop = crop;
+                            self.status = Some(Status::Info(format!(
+                                "Cropped black bars: {} top, {} bottom, {} left, {} right",
+                                crop.top, crop.bottom, crop.left, crop.right
+                            )));
+                        }
+                        Err(error) => {
+                            self.status = Some(Status::Error(format!(
+                                "Could not detect black bars: {error}"
+                            )));
+                        }
+                    }
+                }
                 Event::Capabilities(result) => match result {
                     Ok(capabilities) => {
                         self.capabilities = Some(capabilities);
@@ -182,16 +276,19 @@ impl App {
                     Err(error) => self.capability_error = Some(error),
                 },
                 Event::BatchProgress { current, total } => {
-                    self.batch_status = Some(format!("Importing {current} of {total}…"));
+                    self.status = Some(Status::Info(format!("Reading {current} of {total}…")));
                 }
                 Event::BatchFinished { added, failed } => {
-                    self.batch_status = Some(if failed == 0 {
-                        format!("Added {added} files to the queue")
+                    self.status = Some(if failed == 0 {
+                        Status::Info(format!("Queued {added} {}", plural(added, "file")))
                     } else {
-                        format!("Added {added} files; skipped {failed}")
+                        Status::Error(format!(
+                            "Queued {added} {}; {failed} could not be read",
+                            plural(added, "file")
+                        ))
                     });
                 }
-                Event::Notice(message) => self.request_error = Some(message),
+                Event::Notice(message) => self.status = Some(Status::Error(message)),
                 Event::Snapshot(snapshot) => self.merge_snapshot(snapshot),
             }
             context.request_repaint();
@@ -210,9 +307,55 @@ impl App {
         self.jobs = snapshot;
     }
 
+    fn session(&self) -> Session {
+        let mut settings = self.settings.clone();
+        settings.crop = CropMargins::ZERO;
+        Session {
+            settings,
+            preset: self.preset,
+            custom_preset: self.selected_custom_preset.clone(),
+            output_dir: self.output_dir.clone(),
+        }
+    }
+
+    fn encoder_available(&self) -> bool {
+        self.capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities
+                .video_encoders
+                .contains(&self.settings.video_encoder)
+        })
+    }
+
+    /// Why the batch buttons are disabled, if they are.
+    fn batch_blocker(&self) -> Option<&'static str> {
+        if self.capabilities.is_none() {
+            Some("Still detecting which encoders this machine supports…")
+        } else if !self.encoder_available() {
+            Some("The selected video encoder is not available on this machine.")
+        } else {
+            None
+        }
+    }
+
+    /// Why the current source cannot be queued, if it cannot.
+    fn queue_blocker(&self) -> Option<&'static str> {
+        if self.media.is_none() {
+            Some("Open a video first.")
+        } else if let Some(reason) = self.batch_blocker() {
+            Some(reason)
+        } else if self.output.trim().is_empty() {
+            Some("Choose where to save the encode.")
+        } else if self.trim_end_secs - self.trim_start_secs < 0.1 {
+            Some("The selected range is too short.")
+        } else {
+            None
+        }
+    }
+
     fn open_source(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Video", &["mp4", "mkv", "webm", "mov", "avi", "m4v", "ts"])
+            .add_filter("Video", &VIDEO_EXTENSIONS)
+            .add_filter("All files", &["*"])
             .pick_file()
         {
             self.coordinator.send(Command::Probe(path));
@@ -221,39 +364,72 @@ impl App {
 
     fn add_batch_files(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
-            .add_filter(
-                "Video",
-                &[
-                    "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "mts", "m2ts", "mpg",
-                ],
-            )
+            .add_filter("Video", &VIDEO_EXTENSIONS)
             .pick_files()
         {
-            self.batch_status = Some(format!("Preparing {} files…", paths.len()));
-            self.coordinator.send(Command::BatchFiles {
-                paths,
-                settings: self.settings.clone(),
-            });
+            self.queue_files(paths);
         }
     }
 
     fn add_batch_folder(&mut self) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.batch_status = Some("Scanning folder…".into());
-            self.coordinator.send(Command::BatchFolder {
-                path,
-                settings: self.settings.clone(),
-            });
+            self.queue_folder(path);
         }
     }
 
-    fn add_to_queue(&mut self) {
-        let Some(media) = &self.media else {
+    fn queue_files(&mut self, paths: Vec<PathBuf>) {
+        self.status = Some(Status::Info(format!(
+            "Reading {} {}…",
+            paths.len(),
+            plural(paths.len(), "file")
+        )));
+        self.coordinator.send(Command::BatchFiles {
+            paths,
+            settings: self.settings_for_batch(),
+        });
+    }
+
+    fn queue_folder(&mut self, path: PathBuf) {
+        self.status = Some(Status::Info(format!("Scanning {}…", path.display())));
+        self.coordinator.send(Command::BatchFolder {
+            path,
+            settings: self.settings_for_batch(),
+        });
+    }
+
+    /// Batch files are different sources, so the current source's crop does not apply.
+    fn settings_for_batch(&self) -> EncodeSettings {
+        let mut settings = self.settings.clone();
+        settings.crop = CropMargins::ZERO;
+        settings
+    }
+
+    /// A single dropped file opens for editing; several files or folders are queued.
+    fn handle_dropped(&mut self, paths: Vec<PathBuf>) {
+        if let [path] = paths.as_slice()
+            && path.is_file()
+        {
+            self.coordinator.send(Command::Probe(path.clone()));
             return;
-        };
-        let request = EncodeRequest {
+        }
+        if let Some(reason) = self.batch_blocker() {
+            self.status = Some(Status::Error(format!("Cannot queue files yet. {reason}")));
+            return;
+        }
+        let (folders, files): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| path.is_dir());
+        for folder in folders {
+            self.queue_folder(folder);
+        }
+        if !files.is_empty() {
+            self.queue_files(files);
+        }
+    }
+
+    fn build_request(&self) -> Option<EncodeRequest> {
+        let media = self.media.as_ref()?;
+        Some(EncodeRequest {
             input: media.path.clone(),
-            output: PathBuf::from(&self.output),
+            output: PathBuf::from(self.output.trim()),
             source_duration_secs: media.duration_secs,
             source_width: media.video_stream().and_then(|stream| stream.width),
             source_height: media.video_stream().and_then(|stream| stream.height),
@@ -275,21 +451,218 @@ impl App {
                 .collect(),
             overwrite: false,
             settings: self.settings.clone(),
+        })
+    }
+
+    fn add_current(&mut self, start: bool) {
+        let Some(request) = self.build_request() else {
+            return;
         };
+        self.submit(request, start, None);
+    }
+
+    /// Validates a request and either queues it or asks before replacing an existing file.
+    fn submit(&mut self, request: EncodeRequest, start: bool, replaces: Option<JobId>) {
         if let Err(error) = request.validate() {
-            self.request_error = Some(error.to_string());
-        } else if request.output.exists() {
-            self.pending_overwrite = Some(request);
-        } else {
-            self.request_error = None;
-            self.coordinator.send(Command::Add(request));
+            self.status = Some(Status::Error(capitalize(&error.to_string())));
+            return;
         }
+        if self.jobs.iter().any(|job| {
+            Some(job.id) != replaces
+                && matches!(job.state, JobState::Queued | JobState::Running)
+                && job.request.output == request.output
+        }) {
+            self.status = Some(Status::Error(format!(
+                "Another queued job already saves to {}",
+                request.output.display()
+            )));
+            return;
+        }
+        if request.output.exists() {
+            self.pending_add = Some(PendingAdd {
+                request,
+                start,
+                replaces,
+            });
+        } else {
+            self.enqueue(request, start, replaces);
+        }
+    }
+
+    fn enqueue(&mut self, request: EncodeRequest, start: bool, replaces: Option<JobId>) {
+        if let Some(id) = replaces {
+            self.coordinator.send(Command::Remove(id));
+        }
+        let name = file_name(&request.output);
+        let output = request.output.clone();
+        self.coordinator.send(Command::Add(request));
+        if start {
+            self.coordinator.send(Command::Start);
+            self.status = Some(Status::Info(format!("Encoding {name}")));
+        } else {
+            self.status = Some(Status::Info(format!("Added {name} to the queue")));
+        }
+        // Move the destination along so queueing another clip from this source does not collide.
+        if replaces.is_none()
+            && let Some(media) = &self.media
+            && Path::new(self.output.trim()) == output
+        {
+            self.output = self
+                .suggested_output(&media.path, Some(&output))
+                .display()
+                .to_string();
+        }
+    }
+
+    fn retry(&mut self, id: JobId) {
+        if let Some(job) = self.jobs.iter().find(|job| job.id == id) {
+            let mut request = job.request.clone();
+            request.overwrite = false;
+            self.submit(request, false, Some(id));
+        }
+    }
+
+    /// `<stem>-encoded.<ext>` in the remembered output folder (or beside the source),
+    /// numbered so it never collides with an existing file or a queued job.
+    fn suggested_output(&self, input: &Path, also_taken: Option<&Path>) -> PathBuf {
+        let folder = self
+            .output_dir
+            .as_deref()
+            .filter(|folder| folder.is_dir())
+            .or_else(|| input.parent())
+            .unwrap_or(Path::new(""));
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+        let extension = self.settings.container.extension();
+        let taken = |candidate: &Path| {
+            candidate == input
+                || candidate.exists()
+                || also_taken == Some(candidate)
+                || self.jobs.iter().any(|job| {
+                    matches!(job.state, JobState::Queued | JobState::Running)
+                        && job.request.output == candidate
+                })
+        };
+        let mut candidate = folder.join(format!("{stem}-encoded.{extension}"));
+        for number in 2..1000 {
+            if !taken(&candidate) {
+                break;
+            }
+            candidate = folder.join(format!("{stem}-encoded-{number}.{extension}"));
+        }
+        candidate
+    }
+
+    fn sync_output_extension(&mut self) {
+        if !self.output.trim().is_empty() {
+            self.output = PathBuf::from(self.output.trim())
+                .with_extension(self.settings.container.extension())
+                .display()
+                .to_string();
+        }
+    }
+
+    /// Switches presets while keeping the crop, which describes the source rather than the preset.
+    fn apply_settings(&mut self, settings: EncodeSettings) {
+        let crop = self.settings.crop;
+        self.settings = settings;
+        self.settings.crop = crop;
+        self.reconcile_formats();
+        self.sync_output_extension();
+    }
+
+    fn base_settings(&self) -> EncodeSettings {
+        self.selected_custom_preset
+            .as_ref()
+            .and_then(|name| {
+                self.custom_presets
+                    .iter()
+                    .find(|preset| &preset.name == name)
+            })
+            .map_or_else(|| self.preset.settings(), |preset| preset.settings.clone())
+    }
+
+    fn preset_modified(&self) -> bool {
+        let mut base = self.base_settings();
+        base.crop = self.settings.crop;
+        base != self.settings
+    }
+
+    fn preset_label(&self) -> String {
+        self.selected_custom_preset
+            .clone()
+            .unwrap_or_else(|| self.preset.name().to_owned())
+    }
+
+    /// Keeps the container and audio codec compatible after the video encoder changes.
+    fn reconcile_formats(&mut self) {
+        if !self
+            .settings
+            .container
+            .supports_video(self.settings.video_encoder)
+        {
+            self.settings.container = Container::Matroska;
+            self.sync_output_extension();
+        }
+        if !self
+            .settings
+            .container
+            .supports_audio(self.settings.audio_encoder)
+        {
+            self.settings.audio_encoder = AudioEncoder::Opus;
+        }
+        let range = self.settings.video_encoder.quality_range();
+        self.settings.quality = self.settings.quality.clamp(*range.start(), *range.end());
+    }
+
+    fn detect_crop(&mut self) {
+        let Some(media) = &self.media else {
+            return;
+        };
+        let Some((width, height)) = media
+            .video_stream()
+            .and_then(|video| Some((video.width?, video.height?)))
+        else {
+            return;
+        };
+        self.detecting_crop = true;
+        self.status = Some(Status::Info("Looking for black bars…".into()));
+        self.coordinator.send(Command::DetectCrop {
+            path: media.path.clone(),
+            duration_secs: media.duration_secs,
+            width,
+            height,
+        });
     }
 
     fn schedule_preview(&mut self, fast_seek: bool) {
         self.preview_fast_seek = fast_seek;
         let delay = if fast_seek { 35 } else { 80 };
         self.preview_due = Some(Instant::now() + Duration::from_millis(delay));
+    }
+
+    fn seek_preview(&mut self, at_secs: f64) {
+        let Some(duration) = self.media.as_ref().map(|media| media.duration_secs) else {
+            return;
+        };
+        self.preview_at_secs = at_secs.clamp(0.0, (duration - 0.1).max(0.0));
+        self.schedule_preview(false);
+    }
+
+    fn set_start_at_playhead(&mut self) {
+        self.trim_start_secs = self.preview_at_secs;
+        if self.trim_end_secs - self.trim_start_secs < 0.1 {
+            self.trim_end_secs = self
+                .media
+                .as_ref()
+                .map_or(self.trim_end_secs, |media| media.duration_secs);
+        }
+    }
+
+    fn set_end_at_playhead(&mut self) {
+        self.trim_end_secs = self.preview_at_secs;
+        if self.trim_end_secs - self.trim_start_secs < 0.1 {
+            self.trim_start_secs = 0.0;
+        }
     }
 
     fn dispatch_preview_if_due(&mut self) {
@@ -310,14 +683,96 @@ impl App {
             });
         }
     }
+
+    fn modal_open(&self) -> bool {
+        self.pending_add.is_some() || self.show_save_preset || self.confirm_close
+    }
+
+    fn handle_input(&mut self, context: &egui::Context) {
+        let dropped: Vec<PathBuf> = context.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.handle_dropped(dropped);
+        }
+
+        if context.input(|input| input.viewport().close_requested())
+            && !self.allow_close
+            && self.jobs.iter().any(|job| job.state == JobState::Running)
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+
+        if self.modal_open() {
+            return;
+        }
+        let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+        if context.input_mut(|input| input.consume_shortcut(&open)) {
+            self.open_source();
+        }
+        if self.media.is_none() || context.egui_wants_keyboard_input() {
+            return;
+        }
+        let (step, set_start, set_end) = context.input(|input| {
+            let amount = if input.modifiers.shift { 10.0 } else { 1.0 };
+            let step = if input.key_pressed(egui::Key::ArrowLeft) {
+                -amount
+            } else if input.key_pressed(egui::Key::ArrowRight) {
+                amount
+            } else {
+                0.0
+            };
+            (
+                step,
+                input.key_pressed(egui::Key::I),
+                input.key_pressed(egui::Key::O) && !input.modifiers.command,
+            )
+        });
+        if step != 0.0 {
+            self.seek_preview(self.preview_at_secs + step);
+        }
+        if set_start {
+            self.set_start_at_playhead();
+        }
+        if set_end {
+            self.set_end_at_playhead();
+        }
+    }
+
+    fn update_title(&mut self, context: &egui::Context) {
+        let title = if let Some(job) = self.jobs.iter().find(|job| job.state == JobState::Running) {
+            format!(
+                "{:.0}% · {} — Carbon Disc",
+                job.progress * 100.0,
+                file_name(&job.request.input)
+            )
+        } else if let Some(media) = &self.media {
+            format!("{} — Carbon Disc", file_name(&media.path))
+        } else {
+            "Carbon Disc".into()
+        };
+        if title != self.window_title {
+            context.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root.ctx().clone();
-        context.request_repaint_after(std::time::Duration::from_millis(50));
+        context.request_repaint_after(Duration::from_millis(50));
         self.poll(&context);
+        self.handle_input(&context);
         self.dispatch_preview_if_due();
+        self.update_title(&context);
+
         egui::Panel::top("toolbar")
             .frame(
                 egui::Frame::new()
@@ -325,85 +780,21 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::symmetric(14, 10))
                     .stroke(egui::Stroke::new(1.0, theme::BORDER)),
             )
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("◉  CARBON DISC")
-                            .strong()
-                            .color(theme::VIOLET)
-                            .size(17.0),
-                    );
-                    ui.separator();
-                    if ui.button("＋ Open source").clicked() {
-                        self.open_source();
-                    }
-                    let encoder_available =
-                        self.capabilities.as_ref().is_some_and(|capabilities| {
-                            capabilities
-                                .video_encoders
-                                .contains(&self.settings.video_encoder)
-                        });
-                    if ui
-                        .add_enabled(encoder_available, egui::Button::new("Batch files…"))
-                        .clicked()
-                    {
-                        self.add_batch_files();
-                    }
-                    if ui
-                        .add_enabled(encoder_available, egui::Button::new("Folder…"))
-                        .clicked()
-                    {
-                        self.add_batch_folder();
-                    }
-                    let can_queue = self.media.is_some()
-                        && !self.output.is_empty()
-                        && self.trim_end_secs - self.trim_start_secs >= 0.1
-                        && encoder_available;
-                    if ui
-                        .add_enabled(can_queue, egui::Button::new("Add to queue"))
-                        .clicked()
-                    {
-                        self.add_to_queue();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.jobs.iter().any(|job| job.state == JobState::Queued),
-                            egui::Button::new(RichText::new("▶ Start").color(theme::GREEN)),
-                        )
-                        .clicked()
-                    {
-                        self.coordinator.send(Command::Start);
-                    }
-                    if ui
-                        .add_enabled(
-                            self.jobs.iter().any(|job| job.state == JobState::Running),
-                            egui::Button::new(RichText::new("■ Stop").color(theme::RED)),
-                        )
-                        .clicked()
-                    {
-                        self.coordinator.send(Command::Cancel);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&self.backend).small().color(theme::MUTED));
-                    });
-                });
-                if let Some(status) = &self.batch_status {
-                    ui.label(RichText::new(status).small().color(theme::MUTED));
-                }
-            });
-
+            .show(root, |ui| self.toolbar_ui(ui));
         egui::Panel::right("queue")
             .resizable(true)
-            .default_size(320.0)
-            .min_size(240.0)
+            .default_size(340.0)
+            .min_size(260.0)
             .frame(panel_frame())
             .show(root, |ui| self.queue_ui(ui));
-        egui::Panel::left("source")
-            .resizable(true)
-            .default_size(280.0)
-            .min_size(220.0)
-            .frame(panel_frame())
-            .show(root, |ui| self.source_ui(ui));
+        egui::Panel::bottom("actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(root, |ui| self.action_bar_ui(ui));
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -411,20 +802,29 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(root, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui));
+                let viewport_height = ui.available_height();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.media.is_some() {
+                            self.source_ui(ui, viewport_height);
+                        } else {
+                            self.empty_state_ui(ui);
+                        }
+                        ui.add_space(20.0);
+                        self.settings_ui(ui);
+                    });
             });
-        if self.probing {
-            egui::Window::new("Reading source")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(&context, |ui| {
-                    ui.spinner();
-                    ui.label("Asking FFprobe for tracks and metadata…");
-                });
-        }
+
         self.overwrite_modal(&context);
         self.preset_modal(&context);
+        self.close_modal(&context);
+        paint_drop_overlay(&context);
+    }
+
+    fn on_exit(&mut self) {
+        // Nothing useful can be shown to the user at this point, so a failed save is ignored.
+        let _ = crate::persistence::save_session(&self.session());
     }
 }
 
@@ -436,363 +836,520 @@ fn panel_frame() -> egui::Frame {
 }
 
 impl App {
-    fn source_ui(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "SOURCE");
-        if let Some(error) = &self.probe_error {
-            ui.colored_label(theme::RED, error);
-            ui.add_space(8.0);
-        }
-        let Some(media) = &self.media else {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Drop in a video").size(18.0));
-                ui.label(
-                    RichText::new("Open a file to inspect its tracks and prepare an encode.")
-                        .color(theme::MUTED),
-                );
-                ui.add_space(12.0);
-                if ui.button("Choose video…").clicked() {
-                    self.open_source();
-                }
+    fn toolbar_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("○  CARBON DISC")
+                    .strong()
+                    .color(theme::VIOLET)
+                    .size(17.0),
+            );
+            ui.separator();
+            if ui
+                .button("Open video…")
+                .on_hover_text("Open one video to trim, crop and encode (Ctrl+O)")
+                .clicked()
+            {
+                self.open_source();
+            }
+            let batch_blocker = self.batch_blocker();
+            let hint = "Queue every video using the current preset and settings";
+            if ui
+                .add_enabled(batch_blocker.is_none(), egui::Button::new("Queue files…"))
+                .on_hover_text(hint)
+                .on_disabled_hover_text(batch_blocker.unwrap_or_default())
+                .clicked()
+            {
+                self.add_batch_files();
+            }
+            if ui
+                .add_enabled(batch_blocker.is_none(), egui::Button::new("Queue folder…"))
+                .on_hover_text(format!("{hint}, including subfolders"))
+                .on_disabled_hover_text(batch_blocker.unwrap_or_default())
+                .clicked()
+            {
+                self.add_batch_folder();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(&self.backend).small().color(theme::MUTED));
             });
+        });
+    }
+
+    fn empty_state_ui(&mut self, ui: &mut egui::Ui) {
+        let height = 260.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::click(),
+        );
+        let hovered = response.hovered();
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 10.0, theme::PANEL);
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            10.0,
+            egui::Stroke::new(
+                1.5,
+                if hovered {
+                    theme::VIOLET
+                } else {
+                    theme::BORDER
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let center = rect.center();
+        if self.probing {
+            egui::Spinner::new()
+                .size(28.0)
+                .color(theme::VIOLET)
+                .paint_at(
+                    ui,
+                    egui::Rect::from_center_size(
+                        center - egui::vec2(0.0, 18.0),
+                        egui::vec2(28.0, 28.0),
+                    ),
+                );
+            painter.text(
+                center + egui::vec2(0.0, 22.0),
+                egui::Align2::CENTER_CENTER,
+                "Reading video…",
+                egui::FontId::proportional(16.0),
+                theme::MUTED,
+            );
+            return;
+        }
+        let (title, subtitle, batch_hint) = if file_drop_supported() {
+            (
+                "Drop a video here",
+                "or click to browse",
+                "Drop several files or a folder to queue them all with the settings below.",
+            )
+        } else {
+            (
+                "Open a video",
+                "Click here or press Ctrl+O",
+                "Use Queue files… or Queue folder… to encode many videos with the settings below.",
+            )
+        };
+        painter.text(
+            center - egui::vec2(0.0, 34.0),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(22.0),
+            Color32::WHITE,
+        );
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            subtitle,
+            egui::FontId::proportional(15.0),
+            theme::MUTED,
+        );
+        painter.text(
+            center + egui::vec2(0.0, 46.0),
+            egui::Align2::CENTER_CENTER,
+            batch_hint,
+            egui::FontId::proportional(13.0),
+            theme::MUTED,
+        );
+        if let Some(error) = &self.probe_error {
+            painter.text(
+                center + egui::vec2(0.0, 82.0),
+                egui::Align2::CENTER_CENTER,
+                format!("Could not read that file: {error}"),
+                egui::FontId::proportional(13.0),
+                theme::RED,
+            );
+        }
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.open_source();
+        }
+    }
+
+    fn source_ui(&mut self, ui: &mut egui::Ui, viewport_height: f32) {
+        let Some(media) = &self.media else {
             return;
         };
-        ui.label(
-            RichText::new(media.path.file_name().unwrap_or_default().to_string_lossy())
-                .strong()
-                .size(16.0),
+        let source_duration = media.duration_secs;
+        let video = media.video_stream().cloned();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(file_name(&media.path))
+                    .strong()
+                    .size(18.0)
+                    .color(Color32::WHITE),
+            );
+            if self.probing {
+                ui.spinner();
+            }
+        });
+        let mut facts = vec![format_duration(media.duration_secs)];
+        if let Some(video) = &video {
+            facts.push(format!(
+                "{}×{} {}",
+                video.width.unwrap_or(0),
+                video.height.unwrap_or(0),
+                video.codec.to_uppercase()
+            ));
+        }
+        let audio_count = media.audio_streams().count();
+        facts.push(format!(
+            "{audio_count} audio {}",
+            plural(audio_count, "track")
+        ));
+        facts.push(
+            media
+                .format_name
+                .split(',')
+                .next()
+                .unwrap_or("unknown")
+                .to_uppercase(),
         );
-        ui.label(
-            RichText::new(
-                media
-                    .path
-                    .parent()
-                    .unwrap_or(Path::new(""))
-                    .display()
-                    .to_string(),
-            )
-            .small()
-            .color(theme::MUTED),
-        );
-        ui.add_space(14.0);
-        egui::Grid::new("source_meta")
-            .num_columns(2)
-            .spacing([16.0, 7.0])
-            .show(ui, |ui| {
-                row(ui, "Duration", format_duration(media.duration_secs));
-                row(
-                    ui,
-                    "Container",
+        facts.push(bytes(media.size_bytes));
+        ui.label(RichText::new(facts.join("  ·  ")).color(theme::MUTED));
+        ui.add(
+            egui::Label::new(
+                RichText::new(
                     media
-                        .format_name
-                        .split(',')
-                        .next()
-                        .unwrap_or("unknown")
-                        .to_uppercase(),
-                );
-                row(ui, "Size", bytes(media.size_bytes));
-                if let Some(video) = media.video_stream() {
-                    row(
-                        ui,
-                        "Video",
-                        format!(
-                            "{}  {}×{}",
-                            video.codec.to_uppercase(),
-                            video.width.unwrap_or(0),
-                            video.height.unwrap_or(0)
-                        ),
-                    );
-                }
-                row(
-                    ui,
-                    "Audio",
-                    format!("{} track(s)", media.audio_streams().count()),
-                );
-            });
-        ui.add_space(18.0);
-        heading(ui, "TRACKS");
-        for stream in &media.streams {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(format!("#{}", stream.index));
-                    ui.label(RichText::new(format!("{:?}", stream.kind)).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(stream.codec.to_uppercase()).color(theme::MUTED));
-                    });
+                        .path
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .display()
+                        .to_string(),
+                )
+                .small()
+                .color(theme::MUTED),
+            )
+            .truncate(),
+        );
+        if let Some(error) = &self.probe_error {
+            ui.colored_label(theme::RED, format!("Could not open the new file: {error}"));
+        }
+        ui.add_space(10.0);
+
+        if source_duration <= 0.1 {
+            ui.label(
+                RichText::new(
+                    "This source has no usable duration, so it cannot be previewed or trimmed.",
+                )
+                .color(theme::MUTED),
+            );
+            return;
+        }
+
+        // Preview: a fixed-aspect box so the layout does not jump while frames load.
+        let aspect = video
+            .as_ref()
+            .and_then(|video| Some(video.width? as f32 / video.height?.max(1) as f32))
+            .filter(|aspect| aspect.is_finite() && *aspect > 0.1)
+            .unwrap_or(16.0 / 9.0);
+        let max_height = (viewport_height * 0.4).clamp(160.0, 520.0);
+        let height = (ui.available_width() / aspect).min(max_height);
+        let width = height * aspect;
+        let source_size = video
+            .as_ref()
+            .and_then(|video| Some((video.width?, video.height?)));
+        let cropping = self.tab == Tab::Picture;
+
+        // Tools sit in a strip above the picture, lined up with its edges, so they never cover it.
+        let (strip, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Sense::hover(),
+        );
+        let mut tools = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_center_size(
+                    strip.center(),
+                    egui::vec2(width.max(360.0).min(strip.width()), strip.height()),
+                ))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        if let Some((source_width, source_height)) = source_size {
+            let toggle =
+                widgets::icon_toggle(&mut tools, Icon::Crop, cropping).on_hover_text(if cropping {
+                    "Done cropping"
+                } else {
+                    "Crop: drag the edges of the picture"
                 });
-            });
+            if toggle.clicked() {
+                self.tab = if cropping { Tab::Video } else { Tab::Picture };
+            }
+            if cropping {
+                let label = if self.detecting_crop {
+                    "Detecting…"
+                } else {
+                    "Detect black bars"
+                };
+                if tools
+                    .add_enabled(!self.detecting_crop, egui::Button::new(label))
+                    .on_hover_text("Find letterbox or pillarbox bars and crop them")
+                    .clicked()
+                {
+                    self.detect_crop();
+                }
+                if tools
+                    .add_enabled(!self.settings.crop.is_zero(), egui::Button::new("Reset"))
+                    .on_hover_text("Remove the crop")
+                    .clicked()
+                {
+                    self.settings.crop = CropMargins::ZERO;
+                }
+                let crop = self.settings.crop;
+                tools.label(
+                    RichText::new(format!(
+                        "{} × {}",
+                        source_width.saturating_sub(crop.left + crop.right),
+                        source_height.saturating_sub(crop.top + crop.bottom)
+                    ))
+                    .monospace()
+                    .color(theme::MUTED),
+                );
+            }
+        }
+        tools.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    format_timecode(self.preview_at_secs, true),
+                    format_timecode(source_duration, false)
+                ))
+                .monospace()
+                .color(theme::MUTED),
+            );
+            if self.preview_loading && self.preview_texture.is_some() {
+                ui.spinner();
+            }
+        });
+        ui.add_space(6.0);
+
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
+        let frame_rect = egui::Rect::from_center_size(row.center(), egui::vec2(width, height));
+        ui.painter().rect_filled(frame_rect, 6.0, Color32::BLACK);
+        if let Some(texture) = &self.preview_texture {
+            egui::Image::new(texture)
+                .corner_radius(6)
+                .paint_at(ui, frame_rect);
+        }
+        if let Some((source_width, source_height)) = source_size
+            && crop_editor::show(
+                ui,
+                frame_rect,
+                source_width,
+                source_height,
+                &mut self.settings.crop,
+                cropping,
+            )
+        {
+            // The tool strip above was drawn with the old size; refresh it right away.
+            ui.ctx().request_repaint();
+        }
+        if self.preview_loading && self.preview_texture.is_none() {
+            egui::Spinner::new()
+                .size(28.0)
+                .color(Color32::WHITE)
+                .paint_at(
+                    ui,
+                    egui::Rect::from_center_size(frame_rect.center(), egui::vec2(28.0, 28.0)),
+                );
+        } else if let Some(error) = &self.preview_error {
+            ui.painter().text(
+                frame_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("Preview unavailable: {error}"),
+                egui::FontId::proportional(13.0),
+                theme::RED,
+            );
+        }
+
+        ui.add_space(4.0);
+        let brush_response = range_brush::show(
+            ui,
+            &mut self.trim_start_secs,
+            &mut self.trim_end_secs,
+            &mut self.preview_at_secs,
+            source_duration,
+        );
+        if brush_response.changed() {
+            self.schedule_preview(brush_response.dragged());
+        }
+        if brush_response.drag_stopped() {
+            self.schedule_preview(false);
+        }
+
+        let mut seek_to = None;
+        let mut set_start = false;
+        let mut set_end = false;
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Start").color(theme::MUTED));
+            if ui
+                .add(timecode_drag(
+                    &mut self.trim_start_secs,
+                    0.0..=(self.trim_end_secs - 0.1).max(0.0),
+                ))
+                .on_hover_text("Drag or type a time like 1:30.5")
+                .changed()
+            {
+                seek_to = Some(self.trim_start_secs);
+            }
+            set_start = widgets::icon_button(ui, Icon::MarkIn, true)
+                .on_hover_text("Start the clip at the current frame (I)")
+                .clicked();
+            ui.add_space(14.0);
+            ui.label(RichText::new("End").color(theme::MUTED));
+            if ui
+                .add(timecode_drag(
+                    &mut self.trim_end_secs,
+                    (self.trim_start_secs + 0.1)..=source_duration,
+                ))
+                .on_hover_text("Drag or type a time like 1:30.5")
+                .changed()
+            {
+                seek_to = Some(self.trim_end_secs);
+            }
+            set_end = widgets::icon_button(ui, Icon::MarkOut, true)
+                .on_hover_text("End the clip at the current frame (O)")
+                .clicked();
+            ui.add_space(14.0);
+            let trimmed = self.trim_start_secs > 0.0 || self.trim_end_secs < source_duration - 0.05;
+            ui.label(RichText::new("Length").color(theme::MUTED));
+            ui.label(
+                RichText::new(format_timecode(
+                    self.trim_end_secs - self.trim_start_secs,
+                    false,
+                ))
+                .color(if trimmed {
+                    theme::VIOLET_LIGHT
+                } else {
+                    Color32::WHITE
+                }),
+            );
+            reset = widgets::icon_button(ui, Icon::FullRange, trimmed)
+                .on_hover_text("Use the whole video")
+                .clicked();
+        });
+        if set_start {
+            self.set_start_at_playhead();
+        }
+        if set_end {
+            self.set_end_at_playhead();
+        }
+        if reset {
+            self.trim_start_secs = 0.0;
+            self.trim_end_secs = source_duration;
+        }
+        if let Some(at_secs) = seek_to {
+            self.seek_preview(at_secs);
         }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| { ui.heading("Encode settings"); ui.label(RichText::new("A focused first pass; advanced controls can grow behind the same engine contract.").color(theme::MUTED)); });
-        ui.separator();
-        ui.add_space(8.0);
-        heading(ui, "PRESET");
-        ui.horizontal_wrapped(|ui| {
-            for preset in Preset::ALL {
-                let selected = self.selected_custom_preset.is_none() && self.preset == preset;
-                if ui
-                    .selectable_label(selected, preset.name())
-                    .on_hover_text(preset.description())
-                    .clicked()
-                {
-                    self.preset = preset;
-                    self.selected_custom_preset = None;
-                    self.settings = preset.settings();
-                    if let Some(media) = &self.media {
-                        self.output = suggested_output(&media.path, self.settings.container)
-                            .display()
-                            .to_string();
-                    }
-                }
-            }
-        });
-        self.custom_presets_ui(ui);
-        ui.add_space(18.0);
-        egui::Grid::new("settings")
-            .num_columns(2)
-            .min_col_width(160.0)
-            .spacing([24.0, 12.0])
+        self.preset_bar_ui(ui);
+        ui.add_space(12.0);
+        let audio_label = match &self.media {
+            Some(media) if media.audio_streams().count() > 0 => format!(
+                "Audio  {}/{}",
+                self.selected_audio_tracks.len(),
+                media.audio_streams().count()
+            ),
+            _ => "Audio".into(),
+        };
+        let tabs = [
+            (Tab::Video, "Video".to_owned()),
+            (Tab::Audio, audio_label),
+            (Tab::Picture, "Size & crop".to_owned()),
+        ];
+        egui::Frame::new()
+            .fill(theme::PANEL)
+            .corner_radius(8)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 0,
+                bottom: 18,
+            })
             .show(ui, |ui| {
-                ui.label("Video encoder");
-                if let Some(capabilities) = &self.capabilities {
-                    egui::ComboBox::from_id_salt("video_encoder")
-                        .selected_text(self.settings.video_encoder.display_name())
-                        .show_ui(ui, |ui| {
-                            for encoder in &capabilities.video_encoders {
-                                let label = if encoder.is_hardware() {
-                                    format!("⚡ {}", encoder.display_name())
-                                } else {
-                                    encoder.display_name().to_owned()
-                                };
-                                ui.selectable_value(
-                                    &mut self.settings.video_encoder,
-                                    *encoder,
-                                    label,
-                                );
-                            }
-                        });
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Detecting available encoders…");
-                    });
+                ui.set_width(ui.available_width());
+                widgets::tab_bar(ui, &mut self.tab, &tabs);
+                ui.add_space(14.0);
+                match self.tab {
+                    Tab::Video => self.video_ui(ui),
+                    Tab::Audio => self.audio_ui(ui),
+                    Tab::Picture => self.picture_ui(ui),
                 }
-                ui.end_row();
-                ui.label("Quality value");
-                ui.add(egui::Slider::new(&mut self.settings.quality, 0..=51));
-                ui.end_row();
-                ui.label("Encoder speed");
-                ui.label(format!("{:?}", self.settings.speed));
-                ui.end_row();
-                ui.label("Audio");
-                ui.label(format!(
-                    "{:?} · {} kb/s",
-                    self.settings.audio_encoder, self.settings.audio_bitrate_kbps
-                ));
-                ui.end_row();
-                ui.label("Container");
-                ui.label(format!("{:?}", self.settings.container));
-                ui.end_row();
-                ui.label("Resolution limit");
-                ui.label(match (self.settings.max_width, self.settings.max_height) {
-                    (Some(w), Some(h)) => format!("{w}×{h}"),
-                    _ => "Source resolution".into(),
-                });
-                ui.end_row();
             });
-        if let Some(error) = &self.capability_error {
-            ui.colored_label(theme::RED, format!("Encoder detection failed: {error}"));
-        } else if let Some(capabilities) = &self.capabilities
-            && !capabilities
-                .video_encoders
-                .contains(&self.settings.video_encoder)
-        {
-            ui.colored_label(
-                theme::RED,
-                "This preset's video encoder is unavailable on this machine.",
-            );
-        }
-        ui.add_space(24.0);
-        self.audio_ui(ui);
-        ui.add_space(24.0);
-        self.picture_ui(ui);
-        ui.add_space(24.0);
-        heading(ui, "RANGE");
-        if let Some(source_duration) = self.media.as_ref().map(|media| media.duration_secs) {
-            if source_duration > 0.1 {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Encode a section").strong());
-                        ui.label(
-                            RichText::new(format!(
-                                "{} selected",
-                                format_timecode(self.trim_end_secs - self.trim_start_secs, false)
-                            ))
-                            .color(theme::VIOLET),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("Reset to full video").clicked() {
-                                    self.trim_start_secs = 0.0;
-                                    self.trim_end_secs = source_duration;
-                                    self.preview_at_secs = 0.0;
-                                    self.schedule_preview(false);
-                                }
-                            },
-                        );
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "Preview · {}",
-                                format_timecode(self.preview_at_secs, true)
-                            ))
-                            .strong(),
-                        );
-                        if self.preview_loading {
-                            ui.spinner();
-                            ui.label(RichText::new("Loading frame…").color(theme::MUTED));
-                        }
-                    });
-                    let crop_overlay = self.media.as_ref().and_then(|media| {
-                        let video = media.video_stream()?;
-                        Some((video.width?, video.height?, self.settings.crop))
-                    });
-                    if let Some(texture) = &self.preview_texture {
-                        ui.vertical_centered(|ui| {
-                            let response = ui.add(
-                                egui::Image::new(texture)
-                                    .max_size(egui::vec2(ui.available_width(), 240.0))
-                                    .corner_radius(6),
-                            );
-                            if let Some((width, height, crop)) = crop_overlay {
-                                paint_crop_overlay(ui, response.rect, width, height, crop);
-                            }
-                        });
-                    } else if !self.preview_loading {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 120.0),
-                            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                            |ui| {
-                                ui.label(
-                                    RichText::new("Scrub the timeline to preview a frame")
-                                        .color(theme::MUTED),
-                                );
-                            },
-                        );
-                    }
-                    if let Some(error) = &self.preview_error {
-                        ui.colored_label(theme::RED, error);
-                    }
-                    let brush_response = range_brush::show(
-                        ui,
-                        &mut self.trim_start_secs,
-                        &mut self.trim_end_secs,
-                        &mut self.preview_at_secs,
-                        source_duration,
-                    );
-                    if brush_response.changed() {
-                        self.schedule_preview(brush_response.dragged());
-                    }
-                    if brush_response.drag_stopped() {
-                        self.schedule_preview(false);
-                    }
-                    let mut precise_preview = None;
-                    egui::Grid::new("encode_range")
-                        .num_columns(4)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Start");
-                            if ui.add(
-                                egui::DragValue::new(&mut self.trim_start_secs)
-                                    .range(0.0..=(self.trim_end_secs - 0.1).max(0.0))
-                                    .speed(0.1)
-                                    .suffix(" s"),
-                            ).changed() {
-                                precise_preview = Some(self.trim_start_secs);
-                            }
-                            ui.monospace(format_timecode(self.trim_start_secs, true));
-                            ui.label(RichText::new("drag left handle").small().color(theme::MUTED));
-                            ui.end_row();
-
-                            ui.label("End");
-                            if ui.add(
-                                egui::DragValue::new(&mut self.trim_end_secs)
-                                    .range((self.trim_start_secs + 0.1)..=source_duration)
-                                    .speed(0.1)
-                                    .suffix(" s"),
-                            ).changed() {
-                                precise_preview = Some(self.trim_end_secs);
-                            }
-                            ui.monospace(format_timecode(self.trim_end_secs, true));
-                            ui.label(RichText::new("drag right handle").small().color(theme::MUTED));
-                            ui.end_row();
-                        });
-                    if let Some(at_secs) = precise_preview {
-                        self.preview_at_secs =
-                            at_secs.min((source_duration - 0.1).max(0.0));
-                        self.schedule_preview(false);
-                    }
-                    ui.label(
-                        RichText::new(
-                            "Start and end are preserved with the queued job, so you can queue multiple clips from one source.",
-                        )
-                        .small()
-                        .color(theme::MUTED),
-                    );
-                });
-            } else {
-                ui.label(
-                    RichText::new("This source has no usable duration metadata.")
-                        .color(theme::MUTED),
-                );
-            }
-        } else {
-            ui.label(RichText::new("Open a source to choose a time range.").color(theme::MUTED));
-        }
-        ui.add_space(24.0);
-        heading(ui, "DESTINATION");
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [ui.available_width() - 100.0, 30.0],
-                egui::TextEdit::singleline(&mut self.output).hint_text("Choose an output file"),
-            );
-            if ui.button("Browse…").clicked() {
-                let output = Path::new(&self.output);
-                let dialog = rfd::FileDialog::new()
-                    .set_file_name(output.file_name().unwrap_or_default().to_string_lossy());
-                if let Some(path) = dialog.save_file() {
-                    self.output = path.display().to_string();
-                }
-            }
-        });
-        ui.label(RichText::new("Encodes are written to a temporary file beside the destination and committed only after FFmpeg succeeds.").small().color(theme::MUTED));
-        if let Some(error) = &self.request_error {
-            ui.colored_label(theme::RED, error);
-        }
     }
 
-    fn custom_presets_ui(&mut self, ui: &mut egui::Ui) {
-        let mut selected_settings = None;
-        let mut delete_selected = false;
-        ui.horizontal_wrapped(|ui| {
-            for preset in &self.custom_presets {
-                if ui
-                    .selectable_label(
-                        self.selected_custom_preset.as_deref() == Some(&preset.name),
-                        &preset.name,
-                    )
-                    .on_hover_text(&preset.description)
-                    .clicked()
-                {
-                    selected_settings = Some((preset.name.clone(), preset.settings.clone()));
-                }
+    fn preset_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let modified = self.preset_modified();
+        let mut chosen: Option<(Preset, Option<String>, EncodeSettings)> = None;
+        let mut revert = false;
+        let mut delete = false;
+        let mut import = false;
+        let mut export = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Preset").strong().size(15.0));
+            let label = if modified {
+                format!("{}  (modified)", self.preset_label())
+            } else {
+                self.preset_label()
+            };
+            egui::ComboBox::from_id_salt("preset")
+                .selected_text(label)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for preset in Preset::ALL {
+                        let selected =
+                            self.selected_custom_preset.is_none() && self.preset == preset;
+                        if ui
+                            .selectable_label(selected, preset.name())
+                            .on_hover_text(preset.description())
+                            .clicked()
+                        {
+                            chosen = Some((preset, None, preset.settings()));
+                        }
+                    }
+                    if !self.custom_presets.is_empty() {
+                        ui.separator();
+                        ui.label(RichText::new("Your presets").small().color(theme::MUTED));
+                        for preset in &self.custom_presets {
+                            let selected =
+                                self.selected_custom_preset.as_deref() == Some(&preset.name);
+                            let response = ui.selectable_label(selected, &preset.name);
+                            let response = if preset.description.is_empty() {
+                                response
+                            } else {
+                                response.on_hover_text(&preset.description)
+                            };
+                            if response.clicked() {
+                                chosen = Some((
+                                    self.preset,
+                                    Some(preset.name.clone()),
+                                    preset.settings.clone(),
+                                ));
+                            }
+                        }
+                    }
+                });
+            if modified {
+                revert = ui
+                    .button("Revert")
+                    .on_hover_text("Discard your changes and go back to the preset's settings")
+                    .clicked();
             }
-            if ui.small_button("＋ Save current…").clicked() {
+            if ui
+                .button("Save as preset…")
+                .on_hover_text("Save the current settings so you can pick them next time")
+                .clicked()
+            {
                 self.preset_name_input = self.selected_custom_preset.clone().unwrap_or_default();
                 self.preset_description_input = self
                     .custom_presets
@@ -801,67 +1358,558 @@ impl App {
                     .map_or_else(String::new, |preset| preset.description.clone());
                 self.show_save_preset = true;
             }
-            if ui
-                .add_enabled(
-                    self.selected_custom_preset.is_some(),
-                    egui::Button::new("Delete"),
-                )
-                .clicked()
-            {
-                delete_selected = true;
-            }
-            if ui.small_button("Import…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Carbon Disc presets", &["json"])
-                    .pick_file()
-            {
-                match crate::persistence::import_presets(&path) {
-                    Ok(imported) => {
-                        for preset in imported {
-                            if let Some(existing) = self
-                                .custom_presets
-                                .iter_mut()
-                                .find(|existing| existing.name == preset.name)
-                            {
-                                *existing = preset;
-                            } else {
-                                self.custom_presets.push(preset);
-                            }
+            ui.menu_button("☰", |ui| {
+                if ui
+                    .add_enabled(
+                        self.selected_custom_preset.is_some(),
+                        egui::Button::new("Delete this preset"),
+                    )
+                    .on_disabled_hover_text("Built-in presets cannot be deleted")
+                    .clicked()
+                {
+                    delete = true;
+                }
+                ui.separator();
+                if ui.button("Import presets…").clicked() {
+                    import = true;
+                }
+                if ui
+                    .add_enabled(
+                        !self.custom_presets.is_empty(),
+                        egui::Button::new("Export your presets…"),
+                    )
+                    .clicked()
+                {
+                    export = true;
+                }
+            });
+        });
+        let description = self.selected_custom_preset.as_ref().map_or_else(
+            || self.preset.description().to_owned(),
+            |name| {
+                self.custom_presets
+                    .iter()
+                    .find(|preset| &preset.name == name)
+                    .map(|preset| preset.description.clone())
+                    .unwrap_or_default()
+            },
+        );
+        let summary = settings_summary(&self.settings);
+        ui.label(
+            RichText::new(if description.is_empty() {
+                summary
+            } else {
+                format!("{description}  ·  {summary}")
+            })
+            .color(theme::MUTED),
+        );
+
+        if let Some((preset, custom, settings)) = chosen {
+            self.preset = preset;
+            self.selected_custom_preset = custom;
+            self.apply_settings(settings);
+        }
+        if revert {
+            self.apply_settings(self.base_settings());
+        }
+        if delete && let Some(name) = self.selected_custom_preset.take() {
+            self.custom_presets.retain(|preset| preset.name != name);
+            self.save_custom_presets();
+            self.status = Some(Status::Info(format!("Deleted preset “{name}”")));
+        }
+        if import
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Carbon Disc presets", &["json"])
+                .pick_file()
+        {
+            match crate::persistence::import_presets(&path) {
+                Ok(imported) => {
+                    let count = imported.len();
+                    for preset in imported {
+                        if let Some(existing) = self
+                            .custom_presets
+                            .iter_mut()
+                            .find(|existing| existing.name == preset.name)
+                        {
+                            *existing = preset;
+                        } else {
+                            self.custom_presets.push(preset);
                         }
-                        self.save_custom_presets();
                     }
-                    Err(error) => self.request_error = Some(format!("Import failed: {error}")),
+                    self.save_custom_presets();
+                    self.status = Some(Status::Info(format!(
+                        "Imported {count} {}",
+                        plural(count, "preset")
+                    )));
+                }
+                Err(error) => self.status = Some(Status::Error(format!("Import failed: {error}"))),
+            }
+        }
+        if export
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Carbon Disc presets", &["json"])
+                .set_file_name("carbon-disc-presets.json")
+                .save_file()
+        {
+            self.status = Some(
+                match crate::persistence::export_presets(&path, &self.custom_presets) {
+                    Ok(()) => Status::Info(format!("Exported presets to {}", path.display())),
+                    Err(error) => Status::Error(format!("Export failed: {error}")),
+                },
+            );
+        }
+    }
+
+    fn video_ui(&mut self, ui: &mut egui::Ui) {
+        let mut formats_changed = false;
+        field_row(ui, "Encoder", |ui| {
+            if let Some(capabilities) = &self.capabilities {
+                let before = self.settings.video_encoder;
+                egui::ComboBox::from_id_salt("video_encoder")
+                    .selected_text(encoder_label(self.settings.video_encoder))
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for encoder in &capabilities.video_encoders {
+                            ui.selectable_value(
+                                &mut self.settings.video_encoder,
+                                *encoder,
+                                encoder_label(*encoder),
+                            );
+                        }
+                    });
+                formats_changed |= before != self.settings.video_encoder;
+                if !capabilities
+                    .video_encoders
+                    .contains(&self.settings.video_encoder)
+                {
+                    ui.colored_label(
+                        theme::RED,
+                        "Not available on this machine. Pick another encoder.",
+                    );
+                } else if self.settings.video_encoder.is_hardware() {
+                    hint(
+                        ui,
+                        "⚡ Hardware encoder: much faster, slightly larger files",
+                    );
+                }
+            } else if let Some(error) = &self.capability_error {
+                ui.colored_label(theme::RED, format!("Encoder detection failed: {error}"));
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Detecting encoders…").color(theme::MUTED));
+                });
+            }
+        });
+        field_row(ui, "Quality", |ui| {
+            let range = self.settings.video_encoder.quality_range();
+            ui.spacing_mut().slider_width = 280.0;
+            ui.add(
+                egui::Slider::new(&mut self.settings.quality, range)
+                    .clamping(egui::SliderClamping::Always),
+            );
+            hint(
+                ui,
+                if self.settings.video_encoder.higher_quality_is_better() {
+                    "Higher = better picture, bigger file"
+                } else {
+                    "Lower = better picture, bigger file. Around 18–24 suits most videos."
+                },
+            );
+        });
+        field_row(ui, "Speed", |ui| {
+            let options: Vec<_> = EncoderSpeed::ALL
+                .iter()
+                .map(|speed| (*speed, speed.display_name()))
+                .collect();
+            widgets::segmented(ui, "speed", &mut self.settings.speed, &options, |_| None);
+            hint(ui, "Slower encodes make smaller files at the same quality");
+        });
+        field_row(ui, "Format", |ui| {
+            let options: Vec<_> = Container::ALL
+                .iter()
+                .map(|container| (*container, container.display_name()))
+                .collect();
+            let encoder = self.settings.video_encoder;
+            formats_changed |= widgets::segmented(
+                ui,
+                "container",
+                &mut self.settings.container,
+                &options,
+                |container| {
+                    (!container.supports_video(encoder))
+                        .then(|| format!("{} needs VP9 or AV1 video", container.display_name()))
+                },
+            );
+        });
+        if formats_changed {
+            self.reconcile_formats();
+            self.sync_output_extension();
+        }
+    }
+
+    fn audio_ui(&mut self, ui: &mut egui::Ui) {
+        let tracks: Vec<_> = self
+            .media
+            .as_ref()
+            .map(|media| media.audio_streams().cloned().collect())
+            .unwrap_or_default();
+        field_row(ui, "Tracks", |ui| {
+            if self.media.is_none() {
+                ui.label(
+                    RichText::new(
+                        "Open a video to choose its audio tracks. Queued files keep their first audio track.",
+                    )
+                    .color(theme::MUTED),
+                );
+                return;
+            }
+            if tracks.is_empty() {
+                ui.label(RichText::new("This video has no audio.").color(theme::MUTED));
+                return;
+            }
+            for (number, track) in tracks.iter().enumerate() {
+                let mut selected = self.selected_audio_tracks.contains(&track.index);
+                let mut label = format!(
+                    "{}.  {}",
+                    number + 1,
+                    language_name(track.language.as_deref())
+                );
+                if let Some(title) = &track.title {
+                    label.push_str(&format!(" — {title}"));
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut selected, RichText::new(label).color(Color32::WHITE));
+                    ui.label(
+                        RichText::new(format!(
+                            "{} · {}",
+                            track.codec.to_uppercase(),
+                            channel_layout(track.channels)
+                        ))
+                        .color(theme::MUTED),
+                    );
+                });
+                if selected {
+                    self.selected_audio_tracks.insert(track.index);
+                } else {
+                    self.selected_audio_tracks.remove(&track.index);
                 }
             }
-            if ui
-                .add_enabled(
-                    !self.custom_presets.is_empty(),
-                    egui::Button::new("Export…"),
-                )
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Carbon Disc presets", &["json"])
-                    .set_file_name("carbon-disc-presets.json")
-                    .save_file()
-                && let Err(error) = crate::persistence::export_presets(&path, &self.custom_presets)
-            {
-                self.request_error = Some(format!("Export failed: {error}"));
+            if tracks.len() > 1 {
+                ui.horizontal(|ui| {
+                    if ui.button("Select all").clicked() {
+                        self.selected_audio_tracks
+                            .extend(tracks.iter().map(|track| track.index));
+                    }
+                    if ui.button("Select none").clicked() {
+                        self.selected_audio_tracks.clear();
+                    }
+                });
+            }
+            if self.selected_audio_tracks.is_empty() {
+                ui.colored_label(theme::RED, "No tracks selected: the output will be silent.");
+            }
+        });
+        field_row(ui, "Codec", |ui| {
+            let options: Vec<_> = AudioEncoder::ALL
+                .iter()
+                .map(|encoder| (*encoder, encoder.display_name()))
+                .collect();
+            let container = self.settings.container;
+            widgets::segmented(
+                ui,
+                "audio_codec",
+                &mut self.settings.audio_encoder,
+                &options,
+                |encoder| {
+                    (!container.supports_audio(encoder)).then(|| {
+                        format!(
+                            "{} cannot hold {} audio",
+                            container.display_name(),
+                            encoder.display_name()
+                        )
+                    })
+                },
+            );
+            hint(
+                ui,
+                match self.settings.audio_encoder {
+                    AudioEncoder::Aac => "AAC plays everywhere",
+                    AudioEncoder::Opus => "Opus sounds better at the same bitrate",
+                    AudioEncoder::Copy => "Keeps the original audio untouched",
+                },
+            );
+        });
+        field_row(ui, "Bitrate", |ui| {
+            ui.add_enabled_ui(self.settings.audio_encoder != AudioEncoder::Copy, |ui| {
+                egui::ComboBox::from_id_salt("audio_bitrate")
+                    .selected_text(format!("{} kb/s", self.settings.audio_bitrate_kbps))
+                    .show_ui(ui, |ui| {
+                        for bitrate in AUDIO_BITRATES {
+                            ui.selectable_value(
+                                &mut self.settings.audio_bitrate_kbps,
+                                bitrate,
+                                format!("{bitrate} kb/s"),
+                            );
+                        }
+                    });
+            });
+        });
+    }
+
+    fn picture_ui(&mut self, ui: &mut egui::Ui) {
+        let source = self.media.as_ref().and_then(|media| {
+            let video = media.video_stream()?;
+            Some((video.width?, video.height?))
+        });
+        field_row(ui, "Resolution", |ui| self.resolution_ui(ui, source));
+        field_row(ui, "Crop", |ui| {
+            if let Some((width, height)) = source {
+                self.crop_ui(ui, width, height);
+            } else {
+                ui.label(RichText::new("Open a video to crop it.").color(theme::MUTED));
             }
         });
 
-        if let Some((name, settings)) = selected_settings {
-            self.selected_custom_preset = Some(name);
-            self.settings = settings;
-            if let Some(media) = &self.media {
-                self.output = suggested_output(&media.path, self.settings.container)
-                    .display()
-                    .to_string();
+        if let Some((source_width, source_height)) = source {
+            let crop = self.settings.crop;
+            let cropped_width = source_width.saturating_sub(crop.left + crop.right).max(2);
+            let cropped_height = source_height.saturating_sub(crop.top + crop.bottom).max(2);
+            let (output_width, output_height) = scaled_dimensions(
+                cropped_width,
+                cropped_height,
+                self.settings.max_width,
+                self.settings.max_height,
+            );
+            field_row(ui, "Output", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{output_width} × {output_height}"))
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "from {source_width} × {source_height}{}",
+                            if crop.is_zero() {
+                                String::new()
+                            } else {
+                                format!(", cropped to {cropped_width} × {cropped_height}")
+                            }
+                        ))
+                        .color(theme::MUTED),
+                    );
+                });
+            });
+        }
+    }
+
+    fn resolution_ui(&mut self, ui: &mut egui::Ui, source: Option<(u32, u32)>) {
+        let current = (self.settings.max_width, self.settings.max_height);
+        let matched = RESOLUTION_LIMITS
+            .iter()
+            .find(|(_, width, height)| current == (Some(*width), Some(*height)));
+        let mut custom = current != (None, None) && matched.is_none();
+        let selected_text = match (current, matched) {
+            ((None, None), _) => "Same as source".to_owned(),
+            (_, Some((name, _, _))) => format!("Up to {name}"),
+            _ => "Custom".to_owned(),
+        };
+        egui::ComboBox::from_id_salt("resolution")
+            .selected_text(selected_text)
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(current == (None, None), "Same as source")
+                    .clicked()
+                {
+                    self.settings.max_width = None;
+                    self.settings.max_height = None;
+                    custom = false;
+                }
+                for (name, width, height) in RESOLUTION_LIMITS {
+                    let larger_than_source = source.is_some_and(|(source_width, source_height)| {
+                        width >= source_width && height >= source_height
+                    });
+                    let response = ui
+                        .add_enabled(
+                            !larger_than_source,
+                            egui::Button::selectable(
+                                current == (Some(width), Some(height)),
+                                format!("Up to {name}"),
+                            ),
+                        )
+                        .on_disabled_hover_text("The source is already this size or smaller");
+                    if response.clicked() {
+                        self.settings.max_width = Some(width);
+                        self.settings.max_height = Some(height);
+                        custom = false;
+                    }
+                }
+                if ui.selectable_label(custom, "Custom…").clicked() && !custom {
+                    let (width, height) = source.unwrap_or((1920, 1080));
+                    self.settings.max_width = Some(width);
+                    self.settings.max_height = Some(height);
+                    custom = true;
+                }
+            });
+        if custom {
+            let mut width = self.settings.max_width.unwrap_or(1920);
+            let mut height = self.settings.max_height.unwrap_or(1080);
+            ui.horizontal(|ui| {
+                ui.label("Fit within");
+                ui.add(
+                    egui::DragValue::new(&mut width)
+                        .range(16..=7680)
+                        .speed(2)
+                        .suffix(" px"),
+                );
+                ui.label("×");
+                ui.add(
+                    egui::DragValue::new(&mut height)
+                        .range(16..=4320)
+                        .speed(2)
+                        .suffix(" px"),
+                );
+            });
+            self.settings.max_width = Some(width.max(16) & !1);
+            self.settings.max_height = Some(height.max(16) & !1);
+        }
+        ui.label(
+            RichText::new("Videos are only ever scaled down, keeping their shape.")
+                .small()
+                .color(theme::MUTED),
+        );
+    }
+
+    fn crop_ui(&mut self, ui: &mut egui::Ui, source_width: u32, source_height: u32) {
+        hint(
+            ui,
+            "Drag the edges or corners on the preview, or use Detect black bars there. Fine-tune in pixels below.",
+        );
+        let crop = &mut self.settings.crop;
+        let limits = [
+            source_height.saturating_sub(crop.bottom + 16),
+            source_height.saturating_sub(crop.top + 16),
+            source_width.saturating_sub(crop.right + 16),
+            source_width.saturating_sub(crop.left + 16),
+        ];
+        ui.horizontal(|ui| {
+            for ((label, value), max) in [
+                ("Top", &mut crop.top),
+                ("Bottom", &mut crop.bottom),
+                ("Left", &mut crop.left),
+                ("Right", &mut crop.right),
+            ]
+            .into_iter()
+            .zip(limits)
+            {
+                ui.label(RichText::new(label).color(theme::MUTED));
+                ui.add(pixel_drag(value, max));
+                ui.add_space(6.0);
             }
+        });
+        crop.top &= !1;
+        crop.bottom &= !1;
+        crop.left &= !1;
+        crop.right &= !1;
+    }
+
+    fn action_bar_ui(&mut self, ui: &mut egui::Ui) {
+        if self.media.is_some() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Save as").strong());
+                let browse_width = 90.0;
+                ui.add_sized(
+                    [ui.available_width() - browse_width, 30.0],
+                    egui::TextEdit::singleline(&mut self.output).hint_text("Choose an output file"),
+                );
+                if ui.button("Browse…").clicked() {
+                    let output = PathBuf::from(self.output.trim());
+                    let mut dialog = rfd::FileDialog::new()
+                        .add_filter(
+                            self.settings.container.display_name(),
+                            &[self.settings.container.extension()],
+                        )
+                        .set_file_name(output.file_name().unwrap_or_default().to_string_lossy());
+                    if let Some(folder) = output.parent().filter(|folder| folder.is_dir()) {
+                        dialog = dialog.set_directory(folder);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        self.output_dir = path.parent().map(Path::to_path_buf);
+                        self.output = path
+                            .with_extension(self.settings.container.extension())
+                            .display()
+                            .to_string();
+                    }
+                }
+            });
+            if !self.output.trim().is_empty() && Path::new(self.output.trim()).exists() {
+                ui.label(
+                    RichText::new("A file with this name already exists. You'll be asked before it is replaced.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+            ui.add_space(4.0);
         }
-        if delete_selected && let Some(name) = self.selected_custom_preset.take() {
-            self.custom_presets.retain(|preset| preset.name != name);
-            self.save_custom_presets();
-        }
+        ui.horizontal(|ui| {
+            let blocker = self.queue_blocker();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let start_hint = if self.jobs.iter().any(|job| job.state == JobState::Queued) {
+                    "Add this video to the queue and start encoding (queued jobs run first)"
+                } else {
+                    "Encode this video now"
+                };
+                if ui
+                    .add_enabled(
+                        blocker.is_none(),
+                        egui::Button::new(
+                            RichText::new("▶  Start encode")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(theme::VIOLET)
+                        .min_size(PRIMARY_BUTTON_SIZE),
+                    )
+                    .on_hover_text(start_hint)
+                    .on_disabled_hover_text(blocker.unwrap_or_default())
+                    .clicked()
+                {
+                    self.add_current(true);
+                }
+                if ui
+                    .add_enabled(
+                        blocker.is_none(),
+                        egui::Button::new("Add to queue").min_size(egui::vec2(0.0, 34.0)),
+                    )
+                    .on_hover_text("Queue this video with these settings and keep editing")
+                    .on_disabled_hover_text(blocker.unwrap_or_default())
+                    .clicked()
+                {
+                    self.add_current(false);
+                }
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| match &self.status {
+                        Some(Status::Error(message)) => {
+                            ui.add(
+                                egui::Label::new(RichText::new(message).color(theme::RED))
+                                    .truncate(),
+                            )
+                            .on_hover_text(message);
+                        }
+                        Some(Status::Info(message)) => {
+                            ui.add(
+                                egui::Label::new(RichText::new(message).color(theme::MUTED))
+                                    .truncate(),
+                            );
+                        }
+                        None => {}
+                    },
+                );
+            });
+        });
     }
 
     fn preset_modal(&mut self, context: &egui::Context) {
@@ -870,38 +1918,56 @@ impl App {
         }
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Save custom preset")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(context, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut self.preset_name_input);
-                ui.label("Description");
-                ui.text_edit_singleline(&mut self.preset_description_input);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.preset_name_input.trim().is_empty(),
-                            egui::Button::new("Save preset"),
-                        )
-                        .clicked()
-                    {
-                        save = true;
-                    }
-                });
+        let response = egui::Modal::new(egui::Id::new("save_preset")).show(context, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Save preset");
+            ui.add_space(6.0);
+            ui.label("Name");
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut self.preset_name_input)
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.memory(|memory| memory.focused().is_none()) {
+                name.request_focus();
+            }
+            ui.label("Description (optional)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.preset_description_input)
+                    .desired_width(f32::INFINITY),
+            );
+            let name = self.preset_name_input.trim();
+            if self.custom_presets.iter().any(|preset| preset.name == name) {
+                ui.label(
+                    RichText::new("A preset with this name will be updated.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let can_save = !name.is_empty();
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save").fill(theme::VIOLET))
+                    .clicked()
+                    || (can_save && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
             });
-        if cancel {
+        });
+        if cancel || response.should_close() && !save {
             self.show_save_preset = false;
         } else if save {
             let name = self.preset_name_input.trim().to_owned();
+            let mut settings = self.settings.clone();
+            settings.crop = CropMargins::ZERO;
             let preset = CustomPreset {
                 name: name.clone(),
                 description: self.preset_description_input.trim().to_owned(),
-                settings: self.settings.clone(),
+                settings,
             };
             if let Some(existing) = self
                 .custom_presets
@@ -912,6 +1978,7 @@ impl App {
             } else {
                 self.custom_presets.push(preset);
             }
+            self.status = Some(Status::Info(format!("Saved preset “{name}”")));
             self.selected_custom_preset = Some(name);
             self.show_save_preset = false;
             self.save_custom_presets();
@@ -919,344 +1986,474 @@ impl App {
     }
 
     fn save_custom_presets(&mut self) {
-        match crate::persistence::save_presets(&self.custom_presets) {
-            Ok(()) => self.request_error = None,
-            Err(error) => self.request_error = Some(format!("Could not save presets: {error}")),
+        if let Err(error) = crate::persistence::save_presets(&self.custom_presets) {
+            self.status = Some(Status::Error(format!("Could not save presets: {error}")));
         }
-    }
-
-    fn audio_ui(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "AUDIO TRACKS");
-        let tracks: Vec<_> = self
-            .media
-            .as_ref()
-            .map(|media| media.audio_streams().cloned().collect())
-            .unwrap_or_default();
-        if tracks.is_empty() {
-            ui.label(RichText::new("This source has no audio tracks.").color(theme::MUTED));
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            if ui.small_button("Select all").clicked() {
-                self.selected_audio_tracks
-                    .extend(tracks.iter().map(|track| track.index));
-            }
-            if ui.small_button("Select none").clicked() {
-                self.selected_audio_tracks.clear();
-            }
-            ui.label(
-                RichText::new(format!(
-                    "{} of {} selected",
-                    self.selected_audio_tracks.len(),
-                    tracks.len()
-                ))
-                .color(theme::MUTED),
-            );
-        });
-        for track in tracks {
-            let mut selected = self.selected_audio_tracks.contains(&track.index);
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut selected, "");
-                    ui.label(RichText::new(format!("Track {}", track.index)).strong());
-                    ui.label(track.language.as_deref().unwrap_or("und").to_uppercase());
-                    if let Some(title) = &track.title {
-                        ui.label(RichText::new(title).color(theme::MUTED));
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {} ch",
-                                track.codec.to_uppercase(),
-                                track.channels.unwrap_or(0)
-                            ))
-                            .color(theme::MUTED),
-                        );
-                    });
-                });
-            });
-            if selected {
-                self.selected_audio_tracks.insert(track.index);
-            } else {
-                self.selected_audio_tracks.remove(&track.index);
-            }
-        }
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Selected tracks use");
-            egui::ComboBox::from_id_salt("audio_encoder")
-                .selected_text(format!("{:?}", self.settings.audio_encoder))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.settings.audio_encoder, AudioEncoder::Aac, "AAC");
-                    ui.selectable_value(
-                        &mut self.settings.audio_encoder,
-                        AudioEncoder::Opus,
-                        "Opus",
-                    );
-                    ui.selectable_value(
-                        &mut self.settings.audio_encoder,
-                        AudioEncoder::Copy,
-                        "Passthrough",
-                    );
-                });
-            ui.add_enabled(
-                self.settings.audio_encoder != AudioEncoder::Copy,
-                egui::DragValue::new(&mut self.settings.audio_bitrate_kbps)
-                    .range(32..=1024)
-                    .speed(16)
-                    .suffix(" kb/s"),
-            );
-        });
-        if self.selected_audio_tracks.is_empty() {
-            ui.label(RichText::new("The queued output will be video-only.").color(theme::MUTED));
-        }
-    }
-
-    fn picture_ui(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "DIMENSIONS & CROP");
-        let Some((source_width, source_height)) = self.media.as_ref().and_then(|media| {
-            let video = media.video_stream()?;
-            Some((video.width?, video.height?))
-        }) else {
-            ui.label(
-                RichText::new("Open a source to adjust picture dimensions.").color(theme::MUTED),
-            );
-            return;
-        };
-
-        ui.group(|ui| {
-            let mut limited = self.settings.max_width.is_some() || self.settings.max_height.is_some();
-            if ui.checkbox(&mut limited, "Limit output resolution").changed() {
-                if limited {
-                    self.settings.max_width = Some(source_width);
-                    self.settings.max_height = Some(source_height);
-                } else {
-                    self.settings.max_width = None;
-                    self.settings.max_height = None;
-                }
-            }
-            if limited {
-                let mut width = self.settings.max_width.unwrap_or(source_width);
-                let mut height = self.settings.max_height.unwrap_or(source_height);
-                ui.horizontal(|ui| {
-                    ui.label("Maximum");
-                    ui.add(
-                        egui::DragValue::new(&mut width)
-                            .range(16..=source_width)
-                            .speed(2)
-                            .suffix(" px wide"),
-                    );
-                    ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut height)
-                            .range(16..=source_height)
-                            .speed(2)
-                            .suffix(" px high"),
-                    );
-                });
-                self.settings.max_width = Some(width.max(16) & !1);
-                self.settings.max_height = Some(height.max(16) & !1);
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Crop margins").strong());
-                if ui.small_button("Reset crop").clicked() {
-                    self.settings.crop = crate::CropMargins::ZERO;
-                }
-            });
-            let crop = &mut self.settings.crop;
-            egui::Grid::new("crop_margins")
-                .num_columns(4)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Top");
-                    ui.add(
-                        egui::DragValue::new(&mut crop.top)
-                            .range(0..=source_height.saturating_sub(crop.bottom + 16))
-                            .speed(2),
-                    );
-                    ui.label("Bottom");
-                    ui.add(
-                        egui::DragValue::new(&mut crop.bottom)
-                            .range(0..=source_height.saturating_sub(crop.top + 16))
-                            .speed(2),
-                    );
-                    ui.end_row();
-                    ui.label("Left");
-                    ui.add(
-                        egui::DragValue::new(&mut crop.left)
-                            .range(0..=source_width.saturating_sub(crop.right + 16))
-                            .speed(2),
-                    );
-                    ui.label("Right");
-                    ui.add(
-                        egui::DragValue::new(&mut crop.right)
-                            .range(0..=source_width.saturating_sub(crop.left + 16))
-                            .speed(2),
-                    );
-                    ui.end_row();
-                });
-            crop.top &= !1;
-            crop.bottom &= !1;
-            crop.left &= !1;
-            crop.right &= !1;
-
-            let cropped_width = source_width.saturating_sub(crop.left + crop.right).max(2);
-            let cropped_height = source_height.saturating_sub(crop.top + crop.bottom).max(2);
-            let (output_width, output_height) = scaled_dimensions(
-                cropped_width,
-                cropped_height,
-                self.settings.max_width,
-                self.settings.max_height,
-            );
-            ui.label(
-                RichText::new(format!(
-                    "Source {source_width}×{source_height} · Cropped {cropped_width}×{cropped_height} · Output {output_width}×{output_height}"
-                ))
-                .small()
-                .color(theme::MUTED),
-            );
-        });
     }
 
     fn overwrite_modal(&mut self, context: &egui::Context) {
         let Some(path) = self
-            .pending_overwrite
+            .pending_add
             .as_ref()
-            .map(|request| request.output.clone())
+            .map(|pending| pending.request.output.clone())
         else {
             return;
         };
         let mut replace = false;
         let mut cancel = false;
-        egui::Window::new("Replace existing output?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(context, |ui| {
-                ui.label("A file already exists at this destination:");
-                ui.monospace(path.display().to_string());
-                ui.label(
-                    RichText::new(
-                        "The existing file is kept until the new encode completes successfully.",
-                    )
-                    .color(theme::MUTED),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                    if ui
-                        .button(RichText::new("Replace after encoding").color(theme::RED))
-                        .clicked()
-                    {
-                        replace = true;
-                    }
-                });
+        let response = egui::Modal::new(egui::Id::new("replace_output")).show(context, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Replace existing file?");
+            ui.add_space(6.0);
+            ui.label(format!("{} already exists in", file_name(&path)));
+            ui.monospace(path.parent().unwrap_or(Path::new("")).display().to_string());
+            ui.label(
+                RichText::new(
+                    "The existing file is kept until the new encode finishes successfully.",
+                )
+                .color(theme::MUTED),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Replace").fill(theme::RED.gamma_multiply(0.8)))
+                    .clicked()
+                {
+                    replace = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
             });
-        if cancel {
-            self.pending_overwrite = None;
-        } else if replace && let Some(mut request) = self.pending_overwrite.take() {
+        });
+        if cancel || response.should_close() && !replace {
+            self.pending_add = None;
+        } else if replace && let Some(pending) = self.pending_add.take() {
+            let mut request = pending.request;
             request.overwrite = true;
-            self.request_error = None;
-            self.coordinator.send(Command::Add(request));
+            self.enqueue(request, pending.start, pending.replaces);
+        }
+    }
+
+    fn close_modal(&mut self, context: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let mut quit = false;
+        let mut keep = false;
+        let response = egui::Modal::new(egui::Id::new("confirm_close")).show(context, |ui| {
+            ui.set_width(380.0);
+            ui.heading("An encode is still running");
+            ui.add_space(6.0);
+            ui.label("Quitting stops it. Unfinished jobs stay in the queue for next time.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Keep encoding").clicked() {
+                    keep = true;
+                }
+                if ui
+                    .add(egui::Button::new("Stop and quit").fill(theme::RED.gamma_multiply(0.8)))
+                    .clicked()
+                {
+                    quit = true;
+                }
+            });
+        });
+        if quit {
+            self.confirm_close = false;
+            self.allow_close = true;
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if keep || response.should_close() {
+            self.confirm_close = false;
         }
     }
 
     fn queue_ui(&mut self, ui: &mut egui::Ui) {
+        let running = self.jobs.iter().any(|job| job.state == JobState::Running);
+        let waiting = self
+            .jobs
+            .iter()
+            .filter(|job| job.state == JobState::Queued)
+            .count();
+        let finished = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    JobState::Complete | JobState::Failed | JobState::Cancelled
+                )
+            })
+            .count();
         ui.horizontal(|ui| {
-            heading(ui, &format!("QUEUE · {}", self.jobs.len()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Clear finished").clicked() {
-                    self.coordinator.send(Command::ClearFinished);
-                }
-                if let Some(id) = self.selected_job
-                    && ui.small_button("Remove").clicked()
+            ui.label(
+                RichText::new("Queue")
+                    .strong()
+                    .size(16.0)
+                    .color(Color32::WHITE),
+            );
+            let mut summary = Vec::new();
+            if running {
+                summary.push("1 encoding".to_owned());
+            }
+            if waiting > 0 {
+                summary.push(format!("{waiting} waiting"));
+            }
+            if finished > 0 {
+                summary.push(format!("{finished} finished"));
+            }
+            ui.label(RichText::new(summary.join(" · ")).color(theme::MUTED));
+        });
+        ui.horizontal(|ui| {
+            if running {
+                if ui
+                    .button(RichText::new("■  Stop").color(theme::RED))
+                    .on_hover_text("Cancel the current encode. Waiting jobs stay queued.")
+                    .clicked()
                 {
-                    self.coordinator.send(Command::Remove(id));
+                    self.coordinator.send(Command::Cancel);
+                }
+            } else if ui
+                .add_enabled(
+                    waiting > 0,
+                    egui::Button::new(RichText::new("▶  Start queue").color(if waiting > 0 {
+                        theme::GREEN
+                    } else {
+                        theme::MUTED
+                    })),
+                )
+                .on_disabled_hover_text("Nothing is waiting in the queue")
+                .clicked()
+            {
+                self.coordinator.send(Command::Start);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(finished > 0, egui::Button::new("Clear finished"))
+                    .clicked()
+                {
+                    self.coordinator.send(Command::ClearFinished);
                 }
             });
         });
         ui.separator();
         if self.jobs.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Your encode queue is empty").color(theme::MUTED));
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Nothing queued").color(theme::MUTED).size(15.0));
+                ui.label(
+                    RichText::new(if file_drop_supported() {
+                        "Use “Add to queue” to line up several encodes, or drop multiple files onto the window."
+                    } else {
+                        "Use “Add to queue” to line up several encodes, or Queue files… to add many at once."
+                    })
+                    .small()
+                    .color(theme::MUTED),
+                );
             });
             return;
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for job in &self.jobs {
-                let selected = self.selected_job == Some(job.id);
-                let response = ui.selectable_label(
-                    selected,
-                    format!(
-                        "{}  →  {}",
-                        job.request
-                            .input
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                        job.request
-                            .output
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                    ),
-                );
-                if response.clicked() {
-                    self.selected_job = Some(job.id);
+        let mut actions = Vec::new();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for job in &self.jobs {
+                    job_card(ui, job, &mut actions);
+                    ui.add_space(6.0);
                 }
-                if job.request.range != EncodeRange::ALL {
-                    ui.label(
-                        RichText::new(format!(
-                            "Clip {} → {} · {}",
-                            format_timecode(job.request.range.start_secs, false),
-                            job.request
-                                .range
-                                .end_secs
-                                .map_or_else(|| "end".into(), |end| format_timecode(end, false)),
-                            format_timecode(job.request.output_duration_secs(), false),
-                        ))
-                        .small()
-                        .color(theme::MUTED),
-                    );
+            });
+        for action in actions {
+            match action {
+                JobAction::Remove(id) => self.coordinator.send(Command::Remove(id)),
+                JobAction::Retry(id) => self.retry(id),
+                JobAction::Reveal(path) => {
+                    if let Err(error) = reveal(&path) {
+                        self.status =
+                            Some(Status::Error(format!("Could not open the folder: {error}")));
+                    }
                 }
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::ProgressBar::new(job.progress)
-                            .desired_width((ui.available_width() - 150.0).max(80.0))
-                            .show_percentage(),
-                    );
-                    ui.label(status_text(job));
-                });
-                if let Some(error) = &job.error {
-                    ui.colored_label(theme::RED, error);
-                }
-                ui.add_space(5.0);
             }
-        });
+        }
     }
 }
 
-fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).strong().small().color(theme::MUTED));
+fn job_card(ui: &mut egui::Ui, job: &JobSnapshot, actions: &mut Vec<JobAction>) {
+    let border = match job.state {
+        JobState::Running => theme::VIOLET.gamma_multiply(0.7),
+        _ => theme::BORDER,
+    };
+    egui::Frame::new()
+        .fill(theme::WINDOW)
+        .corner_radius(6)
+        .stroke(egui::Stroke::new(1.0, border))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if job.state != JobState::Running
+                        && ui
+                            .add(egui::Button::new("🗙").small().frame_when_inactive(false))
+                            .on_hover_text("Remove from the queue")
+                            .clicked()
+                    {
+                        actions.push(JobAction::Remove(job.id));
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(file_name(&job.request.input))
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(job.request.input.display().to_string());
+                    });
+                });
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("» {}", file_name(&job.request.output)))
+                        .small()
+                        .color(theme::MUTED),
+                )
+                .truncate(),
+            )
+            .on_hover_text(job.request.output.display().to_string());
+            let mut details = settings_summary(&job.request.settings);
+            if job.request.range != EncodeRange::ALL {
+                details = format!(
+                    "Clip {}–{}  ·  {details}",
+                    format_timecode(job.request.range.start_secs, false),
+                    job.request
+                        .range
+                        .end_secs
+                        .map_or_else(|| "end".into(), |end| format_timecode(end, false)),
+                );
+            }
+            ui.add(egui::Label::new(RichText::new(details).small().color(theme::MUTED)).truncate());
+            ui.add_space(2.0);
+            match job.state {
+                JobState::Running => {
+                    ui.add(
+                        egui::ProgressBar::new(job.progress)
+                            .desired_height(14.0)
+                            .fill(theme::VIOLET)
+                            .text(format!("{:.0}%", job.progress * 100.0)),
+                    );
+                    let mut detail = vec!["Encoding".to_owned()];
+                    if let Some(speed) = job.speed.filter(|speed| *speed > 0.0) {
+                        detail.push(format!("{speed:.2}× realtime"));
+                        let remaining = f64::from(1.0 - job.progress)
+                            * job.request.output_duration_secs()
+                            / f64::from(speed);
+                        detail.push(format!("{} left", format_eta(remaining)));
+                    }
+                    ui.label(
+                        RichText::new(detail.join(" · "))
+                            .small()
+                            .color(theme::VIOLET),
+                    );
+                }
+                JobState::Queued => {
+                    ui.label(RichText::new("Waiting").small().color(theme::MUTED));
+                }
+                JobState::Complete => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("✔ Done").color(theme::GREEN));
+                        if ui.button("Show in folder").clicked() {
+                            actions.push(JobAction::Reveal(job.request.output.clone()));
+                        }
+                    });
+                }
+                JobState::Failed | JobState::Cancelled => {
+                    ui.horizontal(|ui| {
+                        let label = if job.state == JobState::Failed {
+                            "Failed"
+                        } else {
+                            "Cancelled"
+                        };
+                        ui.label(RichText::new(label).color(theme::RED));
+                        if ui
+                            .button("Retry")
+                            .on_hover_text("Put this job back in the queue")
+                            .clicked()
+                        {
+                            actions.push(JobAction::Retry(job.id));
+                        }
+                    });
+                    if let Some(error) = &job.error {
+                        ui.label(RichText::new(error).small().color(theme::RED));
+                    }
+                }
+            }
+        });
 }
-fn row(ui: &mut egui::Ui, key: &str, value: String) {
-    ui.label(RichText::new(key).color(theme::MUTED));
-    ui.label(value);
-    ui.end_row();
+
+/// A settings row: a fixed-width label aligned with the first control on the right.
+fn field_row(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(110.0, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(110.0);
+                ui.label(RichText::new(label).color(theme::MUTED));
+            },
+        );
+        ui.vertical(add_contents);
+    });
+    ui.add_space(10.0);
 }
+
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).small().color(theme::MUTED));
+}
+
+fn pixel_drag(value: &mut u32, max: u32) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .range(0..=max)
+        .speed(2)
+        .suffix(" px")
+}
+
+fn timecode_drag(value: &mut f64, range: std::ops::RangeInclusive<f64>) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .range(range)
+        .speed(0.1)
+        .custom_formatter(|seconds, _| format_timecode(seconds, true))
+        .custom_parser(parse_timecode)
+}
+
+fn paint_drop_overlay(context: &egui::Context) {
+    let hovering = context.input(|input| !input.raw.hovered_files.is_empty());
+    if !hovering {
+        return;
+    }
+    let rect = context.content_rect();
+    let painter = context.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("drop_overlay"),
+    ));
+    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(190));
+    painter.rect_stroke(
+        rect.shrink(16.0),
+        12.0,
+        egui::Stroke::new(2.0, theme::VIOLET),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center() - egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        "Drop to open",
+        egui::FontId::proportional(26.0),
+        Color32::WHITE,
+    );
+    painter.text(
+        rect.center() + egui::vec2(0.0, 18.0),
+        egui::Align2::CENTER_CENTER,
+        "One video opens for editing · several files or a folder are queued",
+        egui::FontId::proportional(14.0),
+        theme::MUTED,
+    );
+}
+
+/// winit only delivers dropped files on X11, Windows and macOS; native Wayland windows never see them.
+fn file_drop_supported() -> bool {
+    cfg!(any(target_os = "windows", target_os = "macos"))
+        || std::env::var_os("WAYLAND_DISPLAY").is_none_or(|display| display.is_empty())
+}
+
+fn encoder_label(encoder: VideoEncoder) -> String {
+    if encoder.is_hardware() {
+        format!("⚡ {}", encoder.display_name())
+    } else {
+        encoder.display_name().to_owned()
+    }
+}
+
+fn settings_summary(settings: &EncodeSettings) -> String {
+    let mut parts = vec![
+        settings.video_encoder.display_name().to_owned(),
+        format!("Q{}", settings.quality),
+        settings.speed.display_name().to_owned(),
+    ];
+    if let (Some(width), Some(height)) = (settings.max_width, settings.max_height) {
+        parts.push(
+            RESOLUTION_LIMITS
+                .iter()
+                .find(|(_, w, h)| (*w, *h) == (width, height))
+                .map_or_else(
+                    || format!("≤{width}×{height}"),
+                    |(name, _, _)| format!("≤{name}"),
+                ),
+        );
+    }
+    parts.push(match settings.audio_encoder {
+        AudioEncoder::Copy => "audio passthrough".to_owned(),
+        encoder => format!(
+            "{} {} kb/s",
+            encoder.display_name(),
+            settings.audio_bitrate_kbps
+        ),
+    });
+    parts.push(settings.container.display_name().to_owned());
+    parts.join(" · ")
+}
+
+fn language_name(code: Option<&str>) -> String {
+    match code.unwrap_or("und") {
+        "eng" | "en" => "English".into(),
+        "jpn" | "ja" => "Japanese".into(),
+        "spa" | "es" => "Spanish".into(),
+        "fre" | "fra" | "fr" => "French".into(),
+        "ger" | "deu" | "de" => "German".into(),
+        "ita" | "it" => "Italian".into(),
+        "por" | "pt" => "Portuguese".into(),
+        "rus" | "ru" => "Russian".into(),
+        "chi" | "zho" | "zh" => "Chinese".into(),
+        "kor" | "ko" => "Korean".into(),
+        "und" | "" => "Unknown language".into(),
+        other => other.to_uppercase(),
+    }
+}
+
+fn channel_layout(channels: Option<u32>) -> String {
+    match channels {
+        Some(1) => "Mono".into(),
+        Some(2) => "Stereo".into(),
+        Some(6) => "5.1".into(),
+        Some(8) => "7.1".into(),
+        Some(count) => format!("{count} ch"),
+        None => "? ch".into(),
+    }
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        word.to_owned()
+    } else {
+        format!("{word}s")
+    }
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn format_duration(seconds: f64) -> String {
-    let total = seconds.max(0.0) as u64;
-    format!(
-        "{:02}:{:02}:{:02}",
-        total / 3600,
-        total / 60 % 60,
-        total % 60
-    )
+    format_timecode(seconds, false)
 }
 
 fn format_timecode(seconds: f64, precise: bool) -> String {
@@ -1280,6 +2477,35 @@ fn format_timecode(seconds: f64, precise: bool) -> String {
     }
 }
 
+/// Accepts `90`, `90.5`, `1:30`, `1:30.5` and `0:01:30.500`.
+fn parse_timecode(text: &str) -> Option<f64> {
+    let mut seconds = 0.0;
+    let parts: Vec<_> = text.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    for (index, part) in parts.iter().enumerate() {
+        let value: f64 = part.trim().parse().ok()?;
+        let is_last = index == parts.len() - 1;
+        if !value.is_finite() || value < 0.0 || (!is_last && value.fract() != 0.0) {
+            return None;
+        }
+        seconds = seconds * 60.0 + value;
+    }
+    Some(seconds)
+}
+
+fn format_eta(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    if total >= 3600 {
+        format!("{}h {:02}m", total / 3600, total / 60 % 60)
+    } else if total >= 60 {
+        format!("{}m {:02}s", total / 60, total % 60)
+    } else {
+        format!("{total}s")
+    }
+}
+
 fn scaled_dimensions(
     width: u32,
     height: u32,
@@ -1294,44 +2520,6 @@ fn scaled_dimensions(
     (output_width, output_height)
 }
 
-fn paint_crop_overlay(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    source_width: u32,
-    source_height: u32,
-    crop: crate::CropMargins,
-) {
-    if crop.is_zero() || source_width == 0 || source_height == 0 {
-        return;
-    }
-    let left = rect.left() + rect.width() * crop.left as f32 / source_width as f32;
-    let right = rect.right() - rect.width() * crop.right as f32 / source_width as f32;
-    let top = rect.top() + rect.height() * crop.top as f32 / source_height as f32;
-    let bottom = rect.bottom() - rect.height() * crop.bottom as f32 / source_height as f32;
-    let shade = Color32::from_black_alpha(180);
-    let painter = ui.painter();
-    painter.rect_filled(
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), top)),
-        0.0,
-        shade,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(rect.left(), bottom), rect.max),
-        0.0,
-        shade,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(rect.left(), top), egui::pos2(left, bottom)),
-        0.0,
-        shade,
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(right, top), egui::pos2(rect.right(), bottom)),
-        0.0,
-        shade,
-    );
-}
-
 fn bytes(value: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut n = value as f64;
@@ -1342,25 +2530,51 @@ fn bytes(value: u64) -> String {
     }
     format!("{n:.1} {}", UNITS[unit])
 }
-fn suggested_output(input: &Path, container: Container) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    input.with_file_name(format!("{stem}-encoded.{}", container.extension()))
+
+/// Opens the system file manager at the encoded file.
+fn reveal(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(Path::new(".")));
+        command
+    };
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
-fn status_text(job: &JobSnapshot) -> RichText {
-    let text = match job.state {
-        JobState::Queued => "Queued".into(),
-        JobState::Running => job
-            .speed
-            .map_or_else(|| "Encoding".into(), |speed| format!("{speed:.2}×")),
-        JobState::Complete => "Complete".into(),
-        JobState::Failed => "Failed".into(),
-        JobState::Cancelled => "Cancelled".into(),
-    };
-    let color = match job.state {
-        JobState::Complete => theme::GREEN,
-        JobState::Failed | JobState::Cancelled => theme::RED,
-        JobState::Running => theme::VIOLET,
-        JobState::Queued => Color32::GRAY,
-    };
-    RichText::new(text).color(color)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timecodes_parse_in_common_forms() {
+        assert_eq!(parse_timecode("90"), Some(90.0));
+        assert_eq!(parse_timecode("1:30.5"), Some(90.5));
+        assert_eq!(parse_timecode("01:01:30.250"), Some(3690.25));
+        assert_eq!(parse_timecode(&format_timecode(75.125, true)), Some(75.125));
+        assert_eq!(parse_timecode("1.5:00"), None);
+        assert_eq!(parse_timecode("abc"), None);
+        assert_eq!(parse_timecode("1:2:3:4"), None);
+    }
+
+    #[test]
+    fn eta_is_compact() {
+        assert_eq!(format_eta(42.0), "42s");
+        assert_eq!(format_eta(192.0), "3m 12s");
+        assert_eq!(format_eta(3720.0), "1h 02m");
+    }
 }
