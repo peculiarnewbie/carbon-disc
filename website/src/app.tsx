@@ -83,14 +83,16 @@ export default function App() {
         <button class="nav" onClick={() => step(-1)} aria-label="Previous screenshot">
           ‹
         </button>
-        <img
-          src={shots[shot()].src}
-          alt={shots[shot()].alt}
-          width={shots[shot()].width}
-          height={shots[shot()].height}
-          class={{ loading: !loaded() }}
-          onLoad={() => setLoaded(true)}
-        />
+        <div class="frame">
+          <img
+            src={shots[shot()].src}
+            alt={shots[shot()].alt}
+            width={shots[shot()].width}
+            height={shots[shot()].height}
+            class={{ loading: !loaded() }}
+            onLoad={() => setLoaded(true)}
+          />
+        </div>
         <button class="nav" onClick={() => step(1)} aria-label="Next screenshot">
           ›
         </button>

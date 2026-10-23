@@ -132,16 +132,27 @@ a {
   min-height: 0;
 }
 
-.shot img {
+.frame {
+  position: relative;
+  height: 100%;
   max-width: min(100%, 860px);
-  max-height: 100%;
+  aspect-ratio: 1552 / 1121;
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 22px 60px rgb(0 0 0 / 0.45);
+  overflow: hidden;
+}
+
+.frame img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   transition: opacity 120ms ease;
 }
 
-.shot img.loading {
+.frame img.loading {
   opacity: 0.3;
 }
 
