@@ -126,7 +126,9 @@ a {
 .shot {
   flex: 1;
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 10px;
   min-height: 0;
 }
 
@@ -153,6 +155,23 @@ a {
   background: var(--panel);
   font-size: 13px;
   color: var(--muted);
+}
+
+.nav {
+  flex-shrink: 0;
+  padding: 8px 4px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  opacity: 0.55;
+  font: inherit;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.nav:hover {
+  opacity: 1;
 }
 
 footer {

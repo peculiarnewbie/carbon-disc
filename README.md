@@ -12,9 +12,13 @@ behind a small, testable Rust interface.
 
 ## Screenshots
 
-![Trimming a clip with a live size estimate and a queue of pending encodes](docs/screenshots/editing.png)
-
-![Crop and resolution controls over the frame preview](docs/screenshots/crop.png)
+<p>
+  <img width="49.4%" src="docs/screenshots/editing.webp" alt="Trimming a clip on the timeline">
+  <img width="49.4%" src="docs/screenshots/estimate.webp" alt="A measured size estimate in the settings panel">
+  <br>
+  <img width="49.4%" src="docs/screenshots/crop.webp" alt="Crop handles over the frame preview">
+  <img width="49.4%" src="docs/screenshots/queue.webp" alt="Two encodes waiting in the queue">
+</p>
 
 The sample video is [Big Buck Bunny](https://peach.blender.org/), © Copyright
 Blender Foundation, licensed CC-BY 3.0.

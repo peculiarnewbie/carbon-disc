@@ -1,4 +1,13 @@
+import { createSignal } from "solid-js";
+
 const REPO = "https://github.com/peculiarnewbie/carbon-disc";
+
+const shots = [
+  { src: "/editing.webp", alt: "Trimming a clip on the timeline" },
+  { src: "/estimate.webp", alt: "A measured size estimate in the settings panel" },
+  { src: "/crop.webp", alt: "Crop handles over the frame preview" },
+  { src: "/queue.webp", alt: "Two encodes waiting in the queue" },
+];
 
 const features = [
   "Trim & crop",
@@ -8,6 +17,9 @@ const features = [
 ];
 
 export default function App() {
+  const [shot, setShot] = createSignal(0);
+  const step = (delta: number) => setShot((i) => (i + delta + shots.length) % shots.length);
+
   return (
     <div class="page">
       <header class="top">
@@ -54,10 +66,13 @@ export default function App() {
       </main>
 
       <section class="shot">
-        <img
-          src="/screenshot.png"
-          alt="Carbon Disc trimming a clip with a live size estimate and a queue of pending encodes"
-        />
+        <button class="nav" onClick={() => step(-1)} aria-label="Previous screenshot">
+          ‹
+        </button>
+        <img src={shots[shot()].src} alt={shots[shot()].alt} />
+        <button class="nav" onClick={() => step(1)} aria-label="Next screenshot">
+          ›
+        </button>
       </section>
 
       <ul class="features">
