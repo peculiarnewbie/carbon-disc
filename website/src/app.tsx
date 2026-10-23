@@ -3,11 +3,21 @@ import { createSignal } from "solid-js";
 const REPO = "https://github.com/peculiarnewbie/carbon-disc";
 
 const shots = [
-  { src: "/editing.webp", alt: "Trimming a clip on the timeline" },
-  { src: "/estimate.webp", alt: "A measured size estimate in the settings panel" },
-  { src: "/crop.webp", alt: "Crop handles over the frame preview" },
-  { src: "/queue.webp", alt: "Two encodes waiting in the queue" },
+  { src: "/editing.webp", alt: "Trimming a clip on the timeline", width: 1551, height: 1128 },
+  {
+    src: "/estimate.webp",
+    alt: "A measured size estimate in the settings panel",
+    width: 1550,
+    height: 1122,
+  },
+  { src: "/crop.webp", alt: "Crop handles over the frame preview", width: 1552, height: 1121 },
+  { src: "/queue.webp", alt: "Two encodes waiting in the queue", width: 1548, height: 1120 },
 ];
+
+// Warm the cache for all screenshots so arrow clicks swap instantly.
+for (const shot of shots) {
+  new Image().src = shot.src;
+}
 
 const features = [
   "Trim & crop",
@@ -18,7 +28,11 @@ const features = [
 
 export default function App() {
   const [shot, setShot] = createSignal(0);
-  const step = (delta: number) => setShot((i) => (i + delta + shots.length) % shots.length);
+  const [loaded, setLoaded] = createSignal(true);
+  const step = (delta: number) => {
+    setLoaded(false);
+    setShot((i) => (i + delta + shots.length) % shots.length);
+  };
 
   return (
     <div class="page">
@@ -69,7 +83,14 @@ export default function App() {
         <button class="nav" onClick={() => step(-1)} aria-label="Previous screenshot">
           ‹
         </button>
-        <img src={shots[shot()].src} alt={shots[shot()].alt} />
+        <img
+          src={shots[shot()].src}
+          alt={shots[shot()].alt}
+          width={shots[shot()].width}
+          height={shots[shot()].height}
+          class={{ loading: !loaded() }}
+          onLoad={() => setLoaded(true)}
+        />
         <button class="nav" onClick={() => step(1)} aria-label="Next screenshot">
           ›
         </button>

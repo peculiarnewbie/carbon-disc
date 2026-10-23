@@ -3,5 +3,5 @@
   "name": "carbon-disc-website",
   "compatibility_date": "2026-10-24",
   "assets": { "directory": "./dist" },
-  "routes": [{ "pattern": "carbon-disc.peculiarnewbie.com", "custom_domain": true }]
+  "routes": [{ "pattern": "carbon-disc.peculiarnewbie.com", "custom_domain": true }],
 }
