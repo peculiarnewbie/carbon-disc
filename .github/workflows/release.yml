@@ -16,14 +16,32 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: x86_64-linux
             ext: ""
+            slim: false
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: x86_64-linux-slim
+            ext: ""
+            slim: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: x86_64-windows
             ext: ".exe"
+            slim: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: x86_64-windows-slim
+            ext: ".exe"
+            slim: true
           - os: macos-14
             target: x86_64-apple-darwin
             platform: x86_64-macos
             ext: ""
+            slim: false
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform: x86_64-macos-slim
+            ext: ""
+            slim: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +57,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
 
       - name: Fetch FFmpeg (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.slim
         shell: bash
         run: |
           curl -fsSLo ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
@@ -48,14 +66,14 @@ jobs:
           cp ffmpeg-master-latest-linux64-gpl/LICENSE.txt bundle/FFmpeg-LICENSE.txt
 
       - name: Fetch FFmpeg (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !matrix.slim
         shell: bash
         run: |
           curl -fsSLo ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
           7z e ffmpeg.zip -y -obundle "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe"
 
       - name: Fetch FFmpeg (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && !matrix.slim
         shell: bash
         run: |
           base="https://evermeet.cx/ffmpeg"
@@ -74,7 +92,12 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           cd bundle
-          cp ../packaging/README.txt ../packaging/THIRD-PARTY-NOTICES.md .
+          if [ "${{ matrix.slim }}" = "true" ]; then
+            cp ../packaging/README-slim.txt README.txt
+          else
+            cp ../packaging/README.txt ../packaging/THIRD-PARTY-NOTICES.md .
+            cp ../packaging/COPYING.GPL-2.0 COPYING.GPL-2.0
+          fi
           if [ "${{ runner.os }}" = "Linux" ]; then
             mkdir -p share/applications
             cp ../packaging/carbon-disc.desktop share/applications/
@@ -83,9 +106,10 @@ jobs:
               cp "../assets/logo-${size}.png" "share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
             done
           fi
-          cp ../packaging/COPYING.GPL-2.0 COPYING.GPL-2.0
-          "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
-          cat ffmpeg-version.txt
+          if [ "${{ matrix.slim }}" != "true" ]; then
+            "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
+            cat ffmpeg-version.txt
+          fi
           cd ..
           ext="tar.gz"
           mv bundle "carbon-disc-v${version}-${{ matrix.platform }}"
