@@ -1376,7 +1376,10 @@ impl App {
         );
         let mut tools = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(strip)
+                .max_rect(egui::Rect::from_center_size(
+                    strip.center(),
+                    egui::vec2(width.max(360.0).min(strip.width()), strip.height()),
+                ))
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         if let Some((source_width, source_height)) = source_size {
@@ -1421,31 +1424,7 @@ impl App {
                 );
             }
         }
-        let mut chip = self.estimate_chip();
-        let mut estimate_clicked = false;
-        let mut corner = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(strip)
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        );
-        corner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(label) = &chip.label {
-                let response = ui.label(label.clone());
-                if let Some(tooltip) = &chip.tooltip {
-                    response.on_hover_text(tooltip);
-                }
-            }
-            if chip.spinner {
-                ui.spinner();
-            }
-            if ui
-                .add_enabled(chip.enabled, egui::Button::new("Estimate").small())
-                .on_hover_text("Encode short samples of this video to project its size")
-                .on_disabled_hover_text(chip.disabled_reason)
-                .clicked()
-            {
-                estimate_clicked = true;
-            }
+        tools.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 RichText::new(format!(
                     "{} / {}",
@@ -1459,9 +1438,6 @@ impl App {
                 ui.spinner();
             }
         });
-        if estimate_clicked && let Some(request) = chip.request.take() {
-            self.begin_size_estimate(request);
-        }
         ui.add_space(6.0);
 
         let (row, _) = ui.allocate_exact_size(
@@ -1627,6 +1603,8 @@ impl App {
     }
 
     fn preset_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let mut chip = self.estimate_chip();
+        let mut estimate_clicked = false;
         let modified = self.preset_modified();
         let mut chosen: Option<(Preset, Option<String>, EncodeSettings)> = None;
         let mut revert = false;
@@ -1721,7 +1699,33 @@ impl App {
                     export = true;
                 }
             });
+            if chip.request.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(chip.enabled, egui::Button::new("Estimate").small())
+                        .on_hover_text("Encode short samples of this video to project its size")
+                        .on_disabled_hover_text(chip.disabled_reason)
+                        .clicked()
+                    {
+                        estimate_clicked = true;
+                    }
+                    if chip.spinner {
+                        ui.spinner();
+                    }
+                    if let Some(label) = &chip.label {
+                        let response = ui.label(label.clone());
+                        if let Some(tooltip) = &chip.tooltip {
+                            response.on_hover_text(tooltip);
+                        }
+                    } else {
+                        ui.label(RichText::new("Estimated size").color(theme::MUTED));
+                    }
+                });
+            }
         });
+        if estimate_clicked && let Some(request) = chip.request.take() {
+            self.begin_size_estimate(request);
+        }
         let description = self.selected_custom_preset.as_ref().map_or_else(
             || self.preset.description().to_owned(),
             |name| {
@@ -2171,7 +2175,11 @@ impl App {
         }
         let label = match &self.size_estimate {
             Some(SizeEstimateState::Sampling { fraction, .. }) => Some((
-                RichText::new(format!("Sampling… {:.0}%", fraction * 100.0)).color(theme::MUTED),
+                RichText::new(format!(
+                    "Estimated size: sampling… {:.0}%",
+                    fraction * 100.0
+                ))
+                .color(theme::MUTED),
                 None,
             )),
             Some(SizeEstimateState::Measured) => {
@@ -2183,10 +2191,14 @@ impl App {
                     let total = measurement.estimate_for(request).total_bytes();
                     match current
                         .as_ref()
-                        .and_then(|request| self.size_measurement_request.as_ref().map(|previous| size_derivation(previous, request)))
+                        .and_then(|request| {
+                            self.size_measurement_request
+                                .as_ref()
+                                .map(|previous| size_derivation(previous, request))
+                        })
                     {
                         Some(SizeDerivation::Same) => (
-                            RichText::new(format!("≈ {}", bytes(total)))
+                            RichText::new(format!("Estimated size ≈ {}", bytes(total)))
                                 .strong()
                                 .color(Color32::WHITE),
                             Some(
@@ -2195,7 +2207,7 @@ impl App {
                             ),
                         ),
                         _ => (
-                            RichText::new(format!("≈ {}*", bytes(total)))
+                            RichText::new(format!("Estimated size ≈ {}*", bytes(total)))
                                 .strong()
                                 .color(Color32::WHITE),
                             Some(format!(
