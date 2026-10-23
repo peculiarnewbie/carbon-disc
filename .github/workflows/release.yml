@@ -79,25 +79,31 @@ jobs:
           "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
           cat ffmpeg-version.txt
           cd ..
-          artifact="carbon-disc-v${version}-${{ matrix.platform }}"
-          mv bundle "$artifact"
+          ext="tar.gz"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$artifact.zip" "$artifact"
+            ext="zip"
+            7z a "carbon-disc-v${version}-${{ matrix.platform }}.zip" "carbon-disc-v${version}-${{ matrix.platform }}"
           else
-            tar -czf "$artifact.tar.gz" "$artifact"
+            tar -czf "carbon-disc-v${version}-${{ matrix.platform }}.tar.gz" "carbon-disc-v${version}-${{ matrix.platform }}"
           fi
+          rm -rf "carbon-disc-v${version}-${{ matrix.platform }}"
+          echo "ext=$ext" >> "$GITHUB_ENV"
 
       - name: Checksum
         shell: bash
         run: |
-          artifact=$(ls carbon-disc-v*)
-          sha256sum $artifact > $artifact.sha256
-          cat $artifact.sha256
+          artifact="carbon-disc-v${GITHUB_REF_NAME#v}-${{ matrix.platform }}.${ext}"
+          sha256sum "$artifact" > "$artifact.sha256"
+          cat "$artifact.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.platform }}
-          path: carbon-disc-v*
+          path: |
+            carbon-disc-v*.tar.gz
+            carbon-disc-v*.tar.gz.sha256
+            carbon-disc-v*.zip
+            carbon-disc-v*.zip.sha256
 
   publish:
     needs: bundle
