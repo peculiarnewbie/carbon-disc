@@ -39,19 +39,41 @@ fn tool_beside(dir: &Path, name: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Release bundles ship FFmpeg beside the app binary: prefer that copy so the
-/// bundle works without touching `PATH`. An explicit environment override wins,
-/// and a bare name falls back to whatever `PATH` provides.
+/// Places a freshly installed FFmpeg can appear that `PATH` misses, because
+/// the running app inherited its environment before the install happened.
+fn well_known_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if cfg!(target_os = "macos") {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    if cfg!(target_os = "windows")
+        && let Some(local) = std::env::var_os("LOCALAPPDATA")
+    {
+        dirs.push(PathBuf::from(local).join(r"Microsoft\WinGet\Links"));
+    }
+    dirs
+}
+
+/// Resolution order: an explicit environment override, FFmpeg shipped beside the
+/// app (release bundles), a downloaded copy in the app-data tools folder,
+/// well-known package-manager locations, and finally whatever `PATH` provides.
 fn resolve_tool(env_var: &str, name: &str) -> PathBuf {
     if let Some(path) = std::env::var_os(env_var) {
         return PathBuf::from(path);
     }
-    if let Some(dir) = std::env::current_exe()
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        && let Some(bundled) = tool_beside(&dir, name)
-    {
-        return bundled;
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let mut dirs: Vec<PathBuf> = exe_dir.into_iter().collect();
+    if let Ok(tools) = crate::persistence::tools_dir() {
+        dirs.push(tools);
+    }
+    dirs.extend(well_known_dirs());
+    for dir in &dirs {
+        if let Some(bundled) = tool_beside(dir, name) {
+            return bundled;
+        }
     }
     PathBuf::from(name)
 }
@@ -514,9 +536,15 @@ impl MediaEngine for FfmpegEngine {
         let output = Command::new(&self.ffmpeg)
             .args(["-hide_banner", "-encoders"])
             .output()
-            .map_err(|source| Error::Launch {
-                program: self.ffmpeg.clone(),
-                source,
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    Error::ToolsMissing(self.ffmpeg.clone())
+                } else {
+                    Error::Launch {
+                        program: self.ffmpeg.clone(),
+                        source,
+                    }
+                }
             })?;
         if !output.status.success() {
             return Err(Error::Process {

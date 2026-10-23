@@ -111,10 +111,18 @@ pub fn save_queue(jobs: &[EncodeRequest]) -> Result<()> {
 }
 
 fn data_path(file_name: &str) -> Result<PathBuf> {
-    let project = ProjectDirs::from("org", "CarbonDisc", "Carbon Disc").ok_or_else(|| {
+    Ok(project_dirs()?.data_local_dir().join(file_name))
+}
+
+/// Where the app looks for a downloaded FFmpeg, beside the data documents.
+pub fn tools_dir() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_local_dir().join("tools"))
+}
+
+fn project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("org", "CarbonDisc", "Carbon Disc").ok_or_else(|| {
         Error::InvalidRequest("the operating system has no application data directory".into())
-    })?;
-    Ok(project.data_local_dir().join(file_name))
+    })
 }
 
 fn validate_version(version: u32) -> Result<()> {

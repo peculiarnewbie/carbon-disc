@@ -103,6 +103,9 @@ pub struct App {
     jobs: Vec<JobSnapshot>,
     capabilities: Option<EngineCapabilities>,
     capability_error: Option<String>,
+    tools_missing: bool,
+    tools_path: Option<String>,
+    checking_tools: bool,
     detecting_crop: bool,
     show_save_preset: bool,
     preset_name_input: String,
@@ -179,6 +182,9 @@ impl App {
             jobs: Vec::new(),
             capabilities: None,
             capability_error: None,
+            tools_missing: false,
+            tools_path: None,
+            checking_tools: false,
             detecting_crop: false,
             show_save_preset: false,
             preset_name_input: String::new(),
@@ -292,9 +298,20 @@ impl App {
                     Ok(capabilities) => {
                         self.capabilities = Some(capabilities);
                         self.capability_error = None;
+                        self.tools_missing = false;
+                        self.tools_path = None;
+                        self.checking_tools = false;
                     }
-                    Err(error) => self.capability_error = Some(error),
+                    Err(error) => {
+                        self.capability_error = Some(error);
+                        self.checking_tools = false;
+                    }
                 },
+                Event::ToolsMissing { program } => {
+                    self.tools_missing = true;
+                    self.checking_tools = false;
+                    self.tools_path = Some(program);
+                }
                 Event::SizeEstimateProgress { id, fraction } => {
                     if let Some(SizeEstimateState::Sampling {
                         id: active,
@@ -374,7 +391,9 @@ impl App {
 
     /// Why the batch buttons are disabled, if they are.
     fn batch_blocker(&self) -> Option<&'static str> {
-        if self.capabilities.is_none() {
+        if self.tools_missing {
+            Some("Install FFmpeg first — see the setup screen.")
+        } else if self.capabilities.is_none() {
             Some("Still detecting which encoders this machine supports…")
         } else if !self.encoder_available() {
             Some("The selected video encoder is not available on this machine.")
@@ -452,6 +471,12 @@ impl App {
 
     /// A single dropped file opens for editing; several files or folders are queued.
     fn handle_dropped(&mut self, paths: Vec<PathBuf>) {
+        if self.tools_missing {
+            self.status = Some(Status::Info(
+                "Install FFmpeg first — the setup screen shows how.".into(),
+            ));
+            return;
+        }
         if let [path] = paths.as_slice()
             && path.is_file()
         {
@@ -852,6 +877,10 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if self.tools_missing {
+                            self.setup_gate_ui(ui);
+                            return;
+                        }
                         if self.media.is_some() {
                             self.source_ui(ui, viewport_height);
                         } else {
@@ -948,6 +977,93 @@ impl App {
                 ui.label(RichText::new(&self.backend).small().color(theme::MUTED));
             });
         });
+    }
+
+    /// Full-window setup screen shown when FFmpeg cannot be found, replacing
+    /// the cryptic encoder-detection error the settings used to surface.
+    fn setup_gate_ui(&mut self, ui: &mut egui::Ui) {
+        let command = install_command();
+        let mut copied = false;
+        let mut recheck = false;
+        ui.vertical_centered(|ui| {
+            ui.add_space(48.0);
+            let (logo, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+            paint_logo(ui.painter(), logo);
+            ui.add_space(20.0);
+            ui.label(
+                RichText::new("Carbon Disc needs FFmpeg")
+                    .strong()
+                    .size(24.0)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "FFmpeg does the actual encoding. Install it with your package \
+                         manager, then check again — or grab a prebuilt download, which \
+                         already includes it.",
+                    )
+                    .color(theme::MUTED),
+                )
+                .wrap(),
+            );
+            ui.add_space(18.0);
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .corner_radius(8)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(command).monospace().color(Color32::WHITE));
+                        if ui.button("Copy").clicked() {
+                            copied = true;
+                        }
+                    });
+                });
+            if cfg!(target_os = "linux") {
+                ui.label(
+                    RichText::new("…or your distribution's package manager.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if self.checking_tools {
+                    ui.spinner();
+                    ui.label(RichText::new("Looking for FFmpeg…").color(theme::MUTED));
+                } else if ui.button("Check again").clicked() {
+                    recheck = true;
+                }
+            });
+            ui.add_space(12.0);
+            if let Some(path) = &self.tools_path {
+                ui.label(
+                    RichText::new(format!("Looked for: {path}"))
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+            ui.label(
+                RichText::new(
+                    "If it was just installed and still is not found, restart Carbon Disc.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
+        });
+        if copied {
+            ui.ctx().copy_text(command.to_owned());
+            self.status = Some(Status::Info(
+                "Install command copied to the clipboard".into(),
+            ));
+        }
+        if recheck {
+            self.checking_tools = true;
+            self.coordinator.send(Command::RecheckTools);
+        }
     }
 
     fn empty_state_ui(&mut self, ui: &mut egui::Ui) {
@@ -2547,6 +2663,16 @@ fn paint_drop_overlay(context: &egui::Context) {
 fn file_drop_supported() -> bool {
     cfg!(any(target_os = "windows", target_os = "macos"))
         || std::env::var_os("WAYLAND_DISPLAY").is_none_or(|display| display.is_empty())
+}
+
+fn install_command() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "winget install --id Gyan.FFmpeg -e --source winget"
+    } else if cfg!(target_os = "macos") {
+        "brew install ffmpeg"
+    } else {
+        "sudo apt install ffmpeg"
+    }
 }
 
 fn encoder_label(encoder: VideoEncoder) -> String {

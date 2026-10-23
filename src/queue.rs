@@ -55,6 +55,7 @@ pub enum Command {
         id: u64,
         request: EncodeRequest,
     },
+    RecheckTools,
     BatchFiles {
         paths: Vec<PathBuf>,
         settings: EncodeSettings,
@@ -85,6 +86,9 @@ pub enum Event {
         result: Result<PreviewFrame, String>,
     },
     Capabilities(Result<EngineCapabilities, String>),
+    ToolsMissing {
+        program: String,
+    },
     CropDetected(Result<crate::CropMargins, String>),
     SizeEstimateProgress {
         id: u64,
@@ -143,10 +147,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
     let capability_engine = engine.clone();
     let capability_events = events.clone();
     thread::spawn(move || {
-        let result = capability_engine
-            .capabilities()
-            .map_err(|error| error.to_string());
-        let _ = capability_events.send(Event::Capabilities(result));
+        report_capabilities(&capability_engine, &capability_events);
     });
     let mut jobs: VecDeque<JobSnapshot> = VecDeque::new();
     let mut next_id = 1;
@@ -263,6 +264,13 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                     let _ = crop_events.send(Event::CropDetected(result));
                 });
             }
+            Command::RecheckTools => {
+                let check_engine = engine.clone();
+                let check_events = events.clone();
+                thread::spawn(move || {
+                    report_capabilities(&check_engine, &check_events);
+                });
+            }
             Command::EstimateSize { id, request } => {
                 if let Some(cancelled) = estimate_cancel.take() {
                     cancelled.store(true, Ordering::Relaxed);
@@ -341,6 +349,24 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
         }
         if processing {
             maybe_start(&engine, &mut jobs, &mut active, &events);
+        }
+    }
+}
+
+/// Reports the capability result, routing a missing FFmpeg to its own event so
+/// the GUI can show the setup screen instead of a cryptic encoder error.
+fn report_capabilities(engine: &Arc<dyn MediaEngine>, events: &Sender<Event>) {
+    match engine.capabilities() {
+        Ok(capabilities) => {
+            let _ = events.send(Event::Capabilities(Ok(capabilities)));
+        }
+        Err(crate::Error::ToolsMissing(program)) => {
+            let _ = events.send(Event::ToolsMissing {
+                program: program.display().to_string(),
+            });
+        }
+        Err(error) => {
+            let _ = events.send(Event::Capabilities(Err(error.to_string())));
         }
     }
 }

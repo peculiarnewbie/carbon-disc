@@ -18,6 +18,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("encode was cancelled")]
     Cancelled,
+    #[error("FFmpeg was not found at {0} — install FFmpeg to use Carbon Disc")]
+    ToolsMissing(PathBuf),
     #[error("output already exists: {0}")]
     OutputExists(PathBuf),
     #[error("invalid request: {0}")]
