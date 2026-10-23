@@ -1,6 +1,6 @@
 [package]
 name = "carbon-disc"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "A friendly, open-source video transcoder powered by FFmpeg"
