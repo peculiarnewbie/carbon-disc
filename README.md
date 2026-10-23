@@ -79,6 +79,7 @@ write a sibling `<source>-encoded.<container>` destination.
 
 ## License
 
-GPL-2.0-or-later. This is compatible with distributing a GPL-enabled FFmpeg build; actual
-distributions must also comply with the licenses of the codecs and FFmpeg configuration
-they ship.
+MIT. Carbon Disc runs FFmpeg as a separate process and never links it, so the
+app itself carries no FFmpeg license obligations — but if you distribute a
+build that bundles an FFmpeg binary, that binary is still governed by its own
+license and build configuration.

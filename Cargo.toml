@@ -2,7 +2,7 @@
 name = "carbon-disc"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-2.0-or-later"
+license = "MIT"
 description = "A friendly, open-source video transcoder powered by FFmpeg"
 repository = "https://github.com/carbon-disc/carbon-disc"
 
