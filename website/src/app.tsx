@@ -56,7 +56,7 @@ export default function App() {
         <h1>Yet another FFmpeg wrapper</h1>
         <p>Open source, built with Rust and egui</p>
         <div class="cta">
-          <a class="primary" href={`${REPO}/releases`}>
+          <a class="primary" href={`${REPO}/releases/latest`}>
             Download
           </a>
           <a class="secondary" href={REPO}>
