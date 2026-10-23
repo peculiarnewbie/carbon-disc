@@ -273,7 +273,7 @@ mod tests {
             };
             self.time += 1.0 / 60.0;
             let mut response = None;
-            self.ctx.run_ui(input, |ui| {
+            let _ = self.ctx.run_ui(input, |ui| {
                 CentralPanel::default().show(ui, |ui| {
                     response = Some(show(
                         ui,
