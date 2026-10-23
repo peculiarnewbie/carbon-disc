@@ -83,7 +83,7 @@ jobs:
               cp "../assets/logo-${size}.png" "share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
             done
           fi
-          curl -fsSL https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt -o COPYING.GPL-2.0
+          cp ../packaging/COPYING.GPL-2.0 COPYING.GPL-2.0
           "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
           cat ffmpeg-version.txt
           cd ..
