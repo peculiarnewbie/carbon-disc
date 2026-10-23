@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Carbon Disc
+GenericName=Video Transcoder
+Comment=Yet another FFmpeg wrapper
+Exec=carbon-disc
+Icon=carbon-disc
+Terminal=false
+Categories=AudioVideo;Video;Utility;

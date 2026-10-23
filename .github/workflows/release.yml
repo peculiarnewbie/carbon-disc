@@ -75,6 +75,14 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           cd bundle
           cp ../packaging/README.txt ../packaging/THIRD-PARTY-NOTICES.md .
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p share/applications
+            cp ../packaging/carbon-disc.desktop share/applications/
+            for size in 16 32 48 64 128 256; do
+              mkdir -p "share/icons/hicolor/${size}x${size}/apps"
+              cp "../assets/logo-${size}.png" "share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
+            done
+          fi
           curl -fsSL https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt -o COPYING.GPL-2.0
           "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
           cat ffmpeg-version.txt

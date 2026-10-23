@@ -11,6 +11,11 @@ Quick start
   To build from source or report issues:
   https://github.com/peculiarnewbie/carbon-disc
 
+Desktop integration (Linux)
+  cp share/applications/carbon-disc.desktop ~/.local/share/applications/
+  cp -r share/icons/* ~/.local/share/icons/
+  (adjust the Exec line to the full path of this folder's carbon-disc)
+
 Bundled software
   FFmpeg (GPL-2.0-or-later) is included — see THIRD-PARTY-NOTICES.md and
   COPYING.GPL-2.0 beside this file.

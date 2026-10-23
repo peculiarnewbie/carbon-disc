@@ -37,26 +37,34 @@ export default function App() {
   return (
     <div class="page">
       <header class="top">
-        <svg class="logo" viewBox="-10 -10 120 120" aria-hidden="true">
+        <svg
+          class="logo"
+          aria-hidden="true"
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox="-10 -10 120 120"
+        >
           <defs>
-            <mask id="logo-cut">
+            <mask id="d">
               <rect x="-10" y="-10" width="120" height="120" fill="#fff" />
               <circle cx="50" cy="50" r="15" fill="#000" />
-              <g fill="#000" transform="rotate(36 50 50)">
-                <circle cx="50" cy="20" r="5.5" />
-                <circle cx="21.5" cy="59.3" r="5.5" />
-                <circle cx="32.4" cy="25.7" r="5.5" />
-                <circle cx="67.6" cy="25.7" r="5.5" />
-                <circle cx="78.5" cy="59.3" r="5.5" />
-              </g>
+              <circle cx="32.37" cy="74.27" r="5.5" fill="#000" />
+              <circle cx="78.53" cy="40.73" r="5.5" fill="#000" />
+              <circle cx="67.63" cy="74.27" r="5.5" fill="#000" />
+              <path
+                d="M 6.15 39.88 A 45 45 0 0 1 53.92 5.17"
+                stroke="#000"
+                stroke-width="35"
+                fill="none"
+                stroke-linecap="round"
+              />
             </mask>
           </defs>
-          <circle cx="50" cy="50" r="46" fill="#8b5cf6" mask="url(#logo-cut)" />
+          <circle cx="50" cy="50" r="46" fill="#8b5cf6" mask="url(#d)" />
           <path
-            d="M -3.5 42.5 A 54 54 0 0 1 42.5 -3.5"
+            d="M 6.15 39.88 A 45 45 0 0 1 53.92 5.17"
+            stroke="#a78bfa"
+            stroke-width="30"
             fill="none"
-            stroke="#8b5cf6"
-            stroke-width="12"
             stroke-linecap="round"
           />
         </svg>
