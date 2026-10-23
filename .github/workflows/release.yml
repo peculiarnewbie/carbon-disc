@@ -1,0 +1,113 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: x86_64-linux
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: x86_64-windows
+            ext: ".exe"
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform: x86_64-macos
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage app binary
+        shell: bash
+        run: |
+          mkdir -p bundle
+          cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
+
+      - name: Fetch FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl -fsSLo ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf ffmpeg.tar.xz
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg ffmpeg-master-latest-linux64-gpl/bin/ffprobe bundle/
+          cp ffmpeg-master-latest-linux64-gpl/LICENSE.txt bundle/FFmpeg-LICENSE.txt
+
+      - name: Fetch FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSLo ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+          7z e ffmpeg.zip -y -obundle "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe"
+
+      - name: Fetch FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          base="https://evermeet.cx/ffmpeg"
+          page=$(curl -fsSL "$base/")
+          ffmpeg_zip=$(grep -oE 'href="ffmpeg-[0-9][^"]*\.zip"' <<<"$page" | head -1 | cut -d'"' -f2)
+          ffprobe_zip=$(grep -oE 'href="ffprobe-[0-9][^"]*\.zip"' <<<"$page" | head -1 | cut -d'"' -f2)
+          test -n "$ffmpeg_zip" && test -n "$ffprobe_zip"
+          curl -fsSLO "$base/$ffmpeg_zip"
+          curl -fsSLO "$base/$ffprobe_zip"
+          unzip -o "$ffmpeg_zip" -d bundle/
+          unzip -o "$ffprobe_zip" -d bundle/
+          chmod +x bundle/ffmpeg bundle/ffprobe
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cd bundle
+          cp ../packaging/README.txt ../packaging/THIRD-PARTY-NOTICES.md .
+          curl -fsSL https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt -o COPYING.GPL-2.0
+          "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
+          cat ffmpeg-version.txt
+          cd ..
+          artifact="carbon-disc-v${version}-${{ matrix.platform }}"
+          mv bundle "$artifact"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$artifact.zip" "$artifact"
+          else
+            tar -czf "$artifact.tar.gz" "$artifact"
+          fi
+
+      - name: Checksum
+        shell: bash
+        run: |
+          artifact=$(ls carbon-disc-v*)
+          sha256sum $artifact > $artifact.sha256
+          cat $artifact.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: carbon-disc-v*
+
+  publish:
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

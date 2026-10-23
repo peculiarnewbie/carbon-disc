@@ -45,12 +45,23 @@ This process boundary is intentional. It avoids unsafe libav FFI, isolates GPL t
 makes cancellation reliable, and allows a future libav or remote worker adapter without
 rewriting the app.
 
+## Install
+
+Prebuilt downloads for Linux, Windows, and macOS bundle FFmpeg, so nothing
+else is needed — grab one from the
+[releases](https://github.com/peculiarnewbie/carbon-disc/releases). The macOS
+build is x86_64 (it runs on Apple Silicon through Rosetta) and is not
+code-signed, so right-click → Open it the first time.
+
 ## Requirements
+
+Building from source needs:
 
 - Rust 1.85 or newer
 - `ffmpeg` and `ffprobe` on `PATH`
 
-Override the tools when developing against a custom build:
+Release bundles ship the tools beside the app binary, which Carbon Disc finds
+automatically. Override the tools when developing against a custom build:
 
 ```bash
 export CARBON_DISC_FFMPEG=/path/to/ffmpeg

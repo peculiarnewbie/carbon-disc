@@ -28,13 +28,39 @@ pub struct FfmpegEngine {
     ffprobe: PathBuf,
 }
 
+/// `ffmpeg`/`ffprobe` sitting in `dir`, matching the platform's executable suffix.
+fn tool_beside(dir: &Path, name: &str) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    let candidate = dir.join(file);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Release bundles ship FFmpeg beside the app binary: prefer that copy so the
+/// bundle works without touching `PATH`. An explicit environment override wins,
+/// and a bare name falls back to whatever `PATH` provides.
+fn resolve_tool(env_var: &str, name: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(env_var) {
+        return PathBuf::from(path);
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        && let Some(bundled) = tool_beside(&dir, name)
+    {
+        return bundled;
+    }
+    PathBuf::from(name)
+}
+
 impl Default for FfmpegEngine {
     fn default() -> Self {
         Self {
-            ffmpeg: std::env::var_os("CARBON_DISC_FFMPEG")
-                .map_or_else(|| "ffmpeg".into(), PathBuf::from),
-            ffprobe: std::env::var_os("CARBON_DISC_FFPROBE")
-                .map_or_else(|| "ffprobe".into(), PathBuf::from),
+            ffmpeg: resolve_tool("CARBON_DISC_FFMPEG", "ffmpeg"),
+            ffprobe: resolve_tool("CARBON_DISC_FFPROBE", "ffprobe"),
         }
     }
 }
@@ -1038,7 +1064,7 @@ fn parse_ppm(bytes: &[u8]) -> Result<PreviewFrame> {
         .get(cursor..cursor + rgb_len)
         .ok_or_else(|| Error::InvalidPreview("PPM pixel data is truncated".into()))?;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
-    for pixel in rgb.chunks_exact(3) {
+    for pixel in rgb.as_chunks::<3>().0 {
         rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
     }
     Ok(PreviewFrame {
@@ -1369,6 +1395,22 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-t", "8.000"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a:0", "copy"]));
         assert!(!args.iter().any(|arg| arg == "-c:a:1"));
+    }
+
+    #[test]
+    fn bundled_tools_are_found_beside_the_executable() {
+        let dir = std::env::temp_dir().join(format!("carbon-disc-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create bundle fixture dir");
+        let ffmpeg = if cfg!(windows) {
+            dir.join("ffmpeg.exe")
+        } else {
+            dir.join("ffmpeg")
+        };
+        std::fs::write(&ffmpeg, b"").expect("create ffmpeg fixture");
+        assert_eq!(tool_beside(&dir, "ffmpeg"), Some(ffmpeg.clone()));
+        assert_eq!(tool_beside(&dir, "ffprobe"), None);
+        let _ = std::fs::remove_file(&ffmpeg);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
