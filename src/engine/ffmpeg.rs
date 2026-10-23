@@ -235,7 +235,7 @@ impl FfmpegEngine {
                 }
             }
         }
-        let mut filters = Vec::new();
+        let mut filters = vec!["scale='trunc(if(gt(sar,0),iw*sar,iw)/2)*2':'ih',setsar=1".into()];
         if !settings.crop.is_zero() {
             filters.push(format!(
                 "crop=iw-{}:ih-{}:{}:{}",
@@ -319,7 +319,11 @@ impl FfmpegEngine {
             OsString::from("-sn"),
             OsString::from("-dn"),
             OsString::from("-vf"),
-            format!("scale={}:-2", max_width.max(16)).into(),
+            format!(
+                "scale={max}:'trunc(if(gt(dar,0),{max}/dar,ih)/2)*2'",
+                max = max_width.max(16)
+            )
+            .into(),
             OsString::from("-f"),
             OsString::from("image2pipe"),
             OsString::from("-vcodec"),
@@ -706,43 +710,73 @@ impl MediaEngine for FfmpegEngine {
             .audio_tracks
             .iter()
             .any(|track| track.encoder == AudioEncoder::Copy);
+        // The sample encodes are independent, so they run in parallel: wall time
+        // is roughly one sample instead of all of them added up.
+        let jobs: Vec<_> = segments
+            .iter()
+            .enumerate()
+            .map(|(index, (start, length))| {
+                let sample = sample_request(request, *start, *length);
+                let output = std::env::temp_dir().join(format!(
+                    "carbon-disc-estimate-{}-{index}.{}",
+                    std::process::id(),
+                    request.settings.container.extension(),
+                ));
+                (index, sample, output)
+            })
+            .collect();
+        let results: Vec<_> = thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .iter()
+                .map(|(index, sample, output)| {
+                    let cancelled = cancelled.clone();
+                    scope.spawn(move || (*index, self.run_sample(sample, output, &cancelled)))
+                })
+                .collect();
+            let joined: Vec<_> = handles.into_iter().map(|handle| handle.join()).collect();
+            joined
+        })
+        .into_iter()
+        .map(|joined| match joined {
+            Ok(value) => value,
+            Err(_) => (
+                0,
+                Err(Error::Process {
+                    program: self.ffmpeg.display().to_string(),
+                    message: "a sample encode thread stopped unexpectedly".into(),
+                }),
+            ),
+        })
+        .collect();
         let mut video_bytes = 0u64;
         let mut copy_bytes = 0u64;
         let mut seconds = 0.0;
         let mut calibration: Option<((f64, f64), u64)> = None;
         let steps = segments.len() + 1;
-        for (index, (start, length)) in segments.iter().enumerate() {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-            let sample = sample_request(request, *start, *length);
-            let output = std::env::temp_dir().join(format!(
-                "carbon-disc-estimate-{}-{index}.{}",
-                std::process::id(),
-                request.settings.container.extension(),
-            ));
-            let result = self.run_sample(&sample, &output, &cancelled);
+        for (position, (index, result)) in results.into_iter().enumerate() {
+            let output = &jobs[position].2;
             // Video bytes must be separated from muxed passthrough audio before the
             // file is deleted, because only video follows the quality scale.
             let sample_video = match &result {
                 Ok((sample_bytes, _)) if passthrough => {
-                    self.video_packet_bytes(&output).unwrap_or(*sample_bytes)
+                    self.video_packet_bytes(output).unwrap_or(*sample_bytes)
                 }
                 Ok((sample_bytes, _)) => *sample_bytes,
                 Err(_) => 0,
             };
-            let _ = std::fs::remove_file(&output);
+            let _ = std::fs::remove_file(output);
             let (sample_bytes, sample_secs) = result?;
             if sample_bytes > 0 && sample_secs > 0.1 {
                 video_bytes += sample_video;
                 copy_bytes += sample_bytes - sample_video;
                 seconds += sample_secs;
                 if index == segments.len() / 2 {
-                    calibration = Some(((*start, *length), sample_video));
+                    let (start, length) = segments[index];
+                    calibration = Some(((start, length), sample_video));
                 }
             }
             emit(EngineEvent::Progress {
-                fraction: (index + 1) as f32 / steps as f32,
+                fraction: (position + 1) as f32 / steps as f32,
                 frame: None,
                 speed: None,
             });
@@ -920,10 +954,11 @@ impl Drop for TemporaryOutput {
     }
 }
 
-/// Sample encodes are short: long enough to ride out keyframe overhead, few enough
-/// that estimating never costs more than a few seconds of real encoding.
-const SAMPLE_SECS: f64 = 8.0;
-const MAX_SAMPLES: usize = 5;
+/// Sample encodes are short and few, and they run in parallel: estimation
+/// trades accuracy for speed, aiming for a few seconds of wall time even on
+/// slow software encoders.
+const SAMPLE_SECS: f64 = 3.0;
+const MAX_SAMPLES: usize = 3;
 /// QP quantizers double every six steps, so quality scaling falls back to this
 /// when the per-video calibration sample cannot run.
 const DEFAULT_QUALITY_STEPS: f64 = 6.0;
@@ -937,7 +972,7 @@ fn sample_segments(range: EncodeRange, source_duration_secs: f64) -> Vec<(f64, f
         return vec![(range.start_secs, duration)];
     }
     let span = duration - SAMPLE_SECS;
-    let count = ((duration / (SAMPLE_SECS * 4.0)) as usize).clamp(1, MAX_SAMPLES);
+    let count = ((duration / (SAMPLE_SECS * 10.0)) as usize).clamp(1, MAX_SAMPLES);
     (0..count)
         .map(|index| {
             let fraction = if count == 1 {
@@ -1008,8 +1043,16 @@ struct ProbeStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    sample_aspect_ratio: Option<String>,
+    side_data_list: Option<Vec<ProbeSideData>>,
     channels: Option<u32>,
     tags: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct ProbeSideData {
+    side_data_type: Option<String>,
+    rotation: Option<f64>,
 }
 
 fn parse_probe(path: &Path, bytes: &[u8]) -> Result<MediaInfo> {
@@ -1037,22 +1080,25 @@ fn parse_probe(path: &Path, bytes: &[u8]) -> Result<MediaInfo> {
         streams: probe
             .streams
             .into_iter()
-            .map(|stream| MediaStream {
-                index: stream.index,
-                kind: match stream.codec_type.as_deref() {
-                    Some("video") => StreamKind::Video,
-                    Some("audio") => StreamKind::Audio,
-                    Some("subtitle") => StreamKind::Subtitle,
-                    Some("data") => StreamKind::Data,
-                    Some("attachment") => StreamKind::Attachment,
-                    _ => StreamKind::Unknown,
-                },
-                codec: stream.codec_name.unwrap_or_else(|| "unknown".into()),
-                width: stream.width,
-                height: stream.height,
-                channels: stream.channels,
-                language: tag(&stream.tags, "language"),
-                title: tag(&stream.tags, "title"),
+            .map(|stream| {
+                let (width, height) = display_dimensions(&stream);
+                MediaStream {
+                    index: stream.index,
+                    kind: match stream.codec_type.as_deref() {
+                        Some("video") => StreamKind::Video,
+                        Some("audio") => StreamKind::Audio,
+                        Some("subtitle") => StreamKind::Subtitle,
+                        Some("data") => StreamKind::Data,
+                        Some("attachment") => StreamKind::Attachment,
+                        _ => StreamKind::Unknown,
+                    },
+                    codec: stream.codec_name.unwrap_or_else(|| "unknown".into()),
+                    width,
+                    height,
+                    channels: stream.channels,
+                    language: tag(&stream.tags, "language"),
+                    title: tag(&stream.tags, "title"),
+                }
             })
             .collect(),
     })
@@ -1133,6 +1179,50 @@ fn parse_ppm_number(token: &[u8], name: &str) -> Result<u32> {
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| Error::InvalidPreview(format!("invalid PPM {name}")))
+}
+
+/// The dimensions the video actually displays at: anamorphic SAR is baked
+/// into the width, and 90°/270° rotation metadata swaps the axes. FFmpeg
+/// autorotates and the encode chain normalizes SAR, so every filter and the
+/// preview then work in these display dimensions with square pixels.
+fn display_dimensions(stream: &ProbeStream) -> (Option<u32>, Option<u32>) {
+    let (Some(width), Some(height)) = (stream.width, stream.height) else {
+        return (stream.width, stream.height);
+    };
+    let sar = stream.sample_aspect_ratio.as_deref().and_then(parse_ratio);
+    let display_width = sar.map_or(width, |sar| (f64::from(width) * sar).round() as u32 & !1);
+    let rotation = stream_rotation(stream).rem_euclid(360.0);
+    if rotation == 90.0 || rotation == 270.0 {
+        (Some(height), Some(display_width.max(2)))
+    } else {
+        (Some(display_width.max(2)), Some(height))
+    }
+}
+
+/// Accepts ffprobe's ratio forms: `375:512`, `0`, or a bare decimal.
+fn parse_ratio(text: &str) -> Option<f64> {
+    let value = if let Some((left, right)) = text.split_once(':') {
+        let left: f64 = left.trim().parse().ok()?;
+        let right: f64 = right.trim().parse().ok()?;
+        left / right
+    } else {
+        text.trim().parse().ok()?
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+fn stream_rotation(stream: &ProbeStream) -> f64 {
+    if let Some(side_data) = &stream.side_data_list
+        && let Some(rotation) = side_data
+            .iter()
+            .find(|data| data.side_data_type.as_deref() == Some("Display Matrix"))
+            .and_then(|data| data.rotation)
+    {
+        return rotation;
+    }
+    tag(&stream.tags, "rotate")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0)
 }
 
 fn tag(tags: &Option<HashMap<String, String>>, key: &str) -> Option<String> {
@@ -1271,7 +1361,11 @@ mod tests {
         let args = FfmpegEngine::preview_args(Path::new("source movie.mkv"), 12.3456, 640, true);
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
         assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
-        assert!(args.windows(2).any(|pair| pair == ["-vf", "scale=640:-2"]));
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == ["-vf", "scale=640:'trunc(if(gt(dar,0),640/dar,ih)/2)*2'"]
+            })
+        );
         assert!(args.windows(2).any(|pair| pair == ["-vcodec", "ppm"]));
     }
 
@@ -1309,11 +1403,10 @@ mod tests {
         };
         let args = FfmpegEngine::encode_args(&request);
         assert!(args.windows(2).any(|pair| {
-            pair
-                == [
-                    "-vf",
-                    "crop=iw-70:ih-30:30:10,scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                ]
+            pair == [
+                "-vf",
+                "scale='trunc(if(gt(sar,0),iw*sar,iw)/2)*2':'ih',setsar=1,crop=iw-70:ih-30:30:10,scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            ]
         }));
     }
 
@@ -1366,12 +1459,12 @@ mod tests {
     #[test]
     fn size_samples_cover_short_ranges_in_full() {
         assert_eq!(
-            sample_segments(crate::EncodeRange::new(2.0, 6.0), 6.0),
-            vec![(2.0, 4.0)]
+            sample_segments(crate::EncodeRange::new(2.0, 5.0), 5.0),
+            vec![(2.0, 3.0)]
         );
         assert_eq!(
-            sample_segments(crate::EncodeRange::ALL, 5.0),
-            vec![(0.0, 5.0)]
+            sample_segments(crate::EncodeRange::ALL, 3.0),
+            vec![(0.0, 3.0)]
         );
     }
 
@@ -1383,12 +1476,12 @@ mod tests {
             assert!(*start >= 100.0 && start + length <= 400.0);
         }
         assert_eq!(segments.first(), Some(&(100.0, SAMPLE_SECS)));
-        assert_eq!(segments.last(), Some(&(392.0, SAMPLE_SECS)));
+        assert_eq!(segments.last(), Some(&(397.0, SAMPLE_SECS)));
         // A range that only fits a few whole samples gets that many.
-        assert_eq!(
-            sample_segments(crate::EncodeRange::new(0.0, 100.0), 100.0),
-            vec![(0.0, 8.0), (46.0, 8.0), (92.0, 8.0)]
-        );
+        let medium = sample_segments(crate::EncodeRange::new(0.0, 100.0), 100.0);
+        assert_eq!(medium.len(), 3);
+        assert_eq!(medium.first(), Some(&(0.0, SAMPLE_SECS)));
+        assert_eq!(medium.last(), Some(&(97.0, SAMPLE_SECS)));
     }
 
     #[test]
@@ -1455,6 +1548,28 @@ mod tests {
                 speed: Some(2.5)
             }
         );
+    }
+
+    #[test]
+    fn probe_reports_display_dimensions_for_anamorphic_video() {
+        let info = parse_probe(
+            Path::new("anamorphic.mp4"),
+            br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"sample_aspect_ratio":"375:512"}],"format":{"format_name":"mov,mp4"}}"#,
+        )
+        .expect("valid fixture");
+        let video = info.video_stream().expect("video stream");
+        assert_eq!((video.width, video.height), (Some(1406), Some(1080)));
+    }
+
+    #[test]
+    fn probe_swaps_dimensions_for_rotated_video() {
+        let info = parse_probe(
+            Path::new("portrait.mp4"),
+            br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"side_data_list":[{"side_data_type":"Display Matrix","rotation":-90.0}]}],"format":{"format_name":"mov,mp4"}}"#,
+        )
+        .expect("valid fixture");
+        let video = info.video_stream().expect("video stream");
+        assert_eq!((video.width, video.height), (Some(1080), Some(1920)));
     }
 
     #[test]
