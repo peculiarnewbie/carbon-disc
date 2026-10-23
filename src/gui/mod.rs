@@ -881,11 +881,39 @@ fn panel_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, theme::BORDER))
 }
 
+/// Paints the brake-disc logo: solid rotor, center bore, five rotated studs and
+/// a caliper gripping the top-left, matching the website icon. Holes are punched
+/// with the toolbar background color, which sits behind it.
+fn paint_logo(painter: &egui::Painter, rect: egui::Rect) {
+    let scale = rect.width() / 120.0;
+    let center = rect.center();
+    let at = |degrees: f32, radius: f32| {
+        egui::pos2(
+            center.x + radius * scale * degrees.to_radians().cos(),
+            center.y + radius * scale * degrees.to_radians().sin(),
+        )
+    };
+    painter.circle_filled(center, 46.0 * scale, theme::VIOLET);
+    painter.circle_filled(center, 15.0 * scale, theme::PANEL);
+    for degrees in [126.0, 198.0, 270.0, 342.0, 54.0] {
+        painter.circle_filled(at(degrees, 30.0), 5.5 * scale, theme::PANEL);
+    }
+    let caliper = (0..=16)
+        .map(|step| at(188.0 + 74.0 * step as f32 / 16.0, 54.0))
+        .collect();
+    painter.add(egui::Shape::line(
+        caliper,
+        egui::Stroke::new(12.0 * scale, theme::VIOLET),
+    ));
+}
+
 impl App {
     fn toolbar_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            let (logo, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            paint_logo(ui.painter(), logo);
             ui.label(
-                RichText::new("○  CARBON DISC")
+                RichText::new("CARBON DISC")
                     .strong()
                     .color(theme::VIOLET)
                     .size(17.0),
