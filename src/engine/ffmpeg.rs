@@ -298,6 +298,7 @@ impl FfmpegEngine {
         path: &Path,
         at_secs: f64,
         max_width: u32,
+        display_aspect: f64,
         fast_seek: bool,
     ) -> Vec<OsString> {
         let mut args = vec![
@@ -320,8 +321,9 @@ impl FfmpegEngine {
             OsString::from("-dn"),
             OsString::from("-vf"),
             format!(
-                "scale={max}:'trunc(if(gt(dar,0),{max}/dar,ih)/2)*2'",
-                max = max_width.max(16)
+                "scale={}:{},format=rgb24",
+                max_width.max(16),
+                preview_height(max_width.max(16), display_aspect)
             )
             .into(),
             OsString::from("-f"),
@@ -603,6 +605,7 @@ impl MediaEngine for FfmpegEngine {
         path: &Path,
         at_secs: f64,
         max_width: u32,
+        display_aspect: f64,
         fast_seek: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<PreviewFrame> {
@@ -612,7 +615,13 @@ impl MediaEngine for FfmpegEngine {
             ));
         }
         let mut child = Command::new(&self.ffmpeg)
-            .args(Self::preview_args(path, at_secs, max_width, fast_seek))
+            .args(Self::preview_args(
+                path,
+                at_secs,
+                max_width,
+                display_aspect,
+                fast_seek,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -996,6 +1005,16 @@ fn sample_request(request: &EncodeRequest, start: f64, length: f64) -> EncodeReq
     sample
 }
 
+/// The preview frame height for a width and display aspect, rounded to even
+/// pixels. Plain numbers instead of a filter expression: some frames report an
+/// undefined aspect ratio, which makes `dar` fail to even evaluate.
+fn preview_height(max_width: u32, display_aspect: f64) -> u32 {
+    if !display_aspect.is_finite() || display_aspect <= 0.0 {
+        return (max_width * 9 / 16) & !1;
+    }
+    ((f64::from(max_width) / display_aspect).round() as u32).max(2) & !1
+}
+
 fn progress_event(values: &HashMap<String, String>, duration_secs: f64) -> EngineEvent {
     let micros = values
         .get("out_time_us")
@@ -1113,7 +1132,7 @@ fn parse_ppm(bytes: &[u8]) -> Result<PreviewFrame> {
     let width = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "width")?;
     let height = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "height")?;
     let maximum = parse_ppm_number(ppm_token(bytes, &mut cursor)?, "color depth")?;
-    if maximum != 255 || width == 0 || height == 0 {
+    if (maximum != 255 && maximum != 65535) || width == 0 || height == 0 {
         return Err(Error::InvalidPreview(
             "unsupported PPM dimensions or color depth".into(),
         ));
@@ -1131,12 +1150,20 @@ fn parse_ppm(bytes: &[u8]) -> Result<PreviewFrame> {
     let pixel_count = (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| Error::InvalidPreview("PPM dimensions overflow".into()))?;
+    let bytes_per_sample = if maximum == 65535 { 2 } else { 1 };
     let rgb_len = pixel_count
-        .checked_mul(3)
+        .checked_mul(3 * bytes_per_sample)
         .ok_or_else(|| Error::InvalidPreview("PPM frame is too large".into()))?;
-    let rgb = bytes
+    let raw = bytes
         .get(cursor..cursor + rgb_len)
         .ok_or_else(|| Error::InvalidPreview("PPM pixel data is truncated".into()))?;
+    // 16-bit PPM samples are big-endian; previews only need 8 bits, so the low
+    // byte of each sample is dropped.
+    let rgb: Vec<u8> = if bytes_per_sample == 2 {
+        raw.as_chunks::<2>().0.iter().map(|pair| pair[0]).collect()
+    } else {
+        raw.to_vec()
+    };
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     for pixel in rgb.as_chunks::<3>().0 {
         rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
@@ -1358,14 +1385,28 @@ mod tests {
 
     #[test]
     fn preview_is_a_single_scaled_ppm_frame() {
-        let args = FfmpegEngine::preview_args(Path::new("source movie.mkv"), 12.3456, 640, true);
+        let args = FfmpegEngine::preview_args(
+            Path::new("source movie.mkv"),
+            12.3456,
+            640,
+            16.0 / 9.0,
+            true,
+        );
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
         assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
         assert!(
             args.windows(2)
-                .any(|pair| { pair == ["-vf", "scale=640:'trunc(if(gt(dar,0),640/dar,ih)/2)*2'"] })
+                .any(|pair| pair == ["-vf", "scale=640:360,format=rgb24"])
         );
         assert!(args.windows(2).any(|pair| pair == ["-vcodec", "ppm"]));
+    }
+
+    #[test]
+    fn parses_sixteen_bit_preview_frame() {
+        let frame = parse_ppm(b"P6\n2 1\n65535\n\x12\x34\xAB\xCD\x00\xFF\x56\x78\x9A\xBC\x0F\x0F")
+            .expect("valid 16-bit PPM");
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(frame.rgba, [0x12, 0xAB, 0x00, 255, 0x56, 0x9A, 0x0F, 255]);
     }
 
     #[test]

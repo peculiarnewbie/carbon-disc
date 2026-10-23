@@ -43,6 +43,7 @@ pub enum Command {
         id: u64,
         path: std::path::PathBuf,
         at_secs: f64,
+        display_aspect: f64,
         fast_seek: bool,
     },
     DetectCrop {
@@ -228,6 +229,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 id,
                 path,
                 at_secs,
+                display_aspect,
                 fast_seek,
             } => {
                 if let Some(cancelled) = preview_cancel.take() {
@@ -240,7 +242,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 let _ = events.send(Event::PreviewStarted { id, at_secs });
                 thread::spawn(move || {
                     let result = preview_engine
-                        .preview(&path, at_secs, 1280, fast_seek, cancelled)
+                        .preview(&path, at_secs, 1280, display_aspect, fast_seek, cancelled)
                         .map_err(|error| error.to_string());
                     let _ = preview_events.send(Event::PreviewFinished {
                         id,

@@ -37,6 +37,7 @@ const RESOLUTION_LIMITS: [(&str, u32, u32); 5] = [
     ("480p", 854, 480),
 ];
 const AUDIO_BITRATES: [u16; 9] = [64, 96, 128, 160, 192, 256, 320, 384, 512];
+const ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(1500);
 const PRIMARY_BUTTON_SIZE: egui::Vec2 = egui::vec2(150.0, 34.0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,14 +59,11 @@ enum SizeEstimateState {
     Failed(String),
 }
 
-/// Everything the top-right estimate chip needs to render and act.
+/// What the estimate readout in the preset row renders.
 struct EstimateChip {
     label: Option<RichText>,
     tooltip: Option<String>,
     spinner: bool,
-    enabled: bool,
-    disabled_reason: &'static str,
-    request: Option<EncodeRequest>,
 }
 
 /// A job waiting on the "replace existing file?" confirmation.
@@ -106,6 +104,7 @@ pub struct App {
     size_estimate: Option<SizeEstimateState>,
     size_measurement: Option<SizeMeasurement>,
     size_measurement_request: Option<EncodeRequest>,
+    estimate_due: Option<Instant>,
     next_estimate_id: u64,
     selected_audio_tracks: BTreeSet<u32>,
     pending_add: Option<PendingAdd>,
@@ -185,6 +184,7 @@ impl App {
             size_estimate: None,
             size_measurement: None,
             size_measurement_request: None,
+            estimate_due: None,
             next_estimate_id: 1,
             selected_audio_tracks: BTreeSet::new(),
             pending_add: None,
@@ -243,6 +243,7 @@ impl App {
                                 .display()
                                 .to_string();
                             self.media = Some(media);
+                            self.estimate_due = Some(Instant::now() + ESTIMATE_DEBOUNCE);
                         }
                         Err(error) => self.probe_error = Some(error),
                     }
@@ -746,6 +747,26 @@ impl App {
         }
     }
 
+    /// Estimates run on their own: when a video loads, and again whenever the
+    /// current request invalidates the last measurement — no button needed.
+    fn dispatch_estimate_if_due(&mut self) {
+        if self.estimate_due.is_none_or(|due| due > Instant::now())
+            || self.media.is_none()
+            || matches!(self.size_estimate, Some(SizeEstimateState::Sampling { .. }))
+        {
+            return;
+        }
+        let encoding = self.jobs.iter().any(|job| job.state == JobState::Running);
+        let range_too_short = self.trim_end_secs - self.trim_start_secs < 0.1;
+        if encoding || range_too_short || self.batch_blocker().is_some() {
+            return; // Stay due: fire as soon as the block clears.
+        }
+        self.estimate_due = None;
+        if let Some(request) = self.build_request() {
+            self.begin_size_estimate(request);
+        }
+    }
+
     fn dispatch_preview_if_due(&mut self) {
         if self.preview_due.is_none_or(|due| due > Instant::now()) {
             return;
@@ -760,6 +781,7 @@ impl App {
                 id,
                 path: media.path.clone(),
                 at_secs: self.preview_at_secs,
+                display_aspect: display_aspect(media),
                 fast_seek: self.preview_fast_seek,
             });
         }
@@ -852,6 +874,7 @@ impl eframe::App for App {
         self.poll(&context);
         self.handle_input(&context);
         self.dispatch_preview_if_due();
+        self.dispatch_estimate_if_due();
         self.update_title(&context);
 
         egui::Panel::top("toolbar")
@@ -1603,8 +1626,7 @@ impl App {
     }
 
     fn preset_bar_ui(&mut self, ui: &mut egui::Ui) {
-        let mut chip = self.estimate_chip();
-        let mut estimate_clicked = false;
+        let chip = self.estimate_chip();
         let modified = self.preset_modified();
         let mut chosen: Option<(Preset, Option<String>, EncodeSettings)> = None;
         let mut revert = false;
@@ -1699,33 +1721,20 @@ impl App {
                     export = true;
                 }
             });
-            if chip.request.is_some() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(chip.enabled, egui::Button::new("Estimate").small())
-                        .on_hover_text("Encode short samples of this video to project its size")
-                        .on_disabled_hover_text(chip.disabled_reason)
-                        .clicked()
-                    {
-                        estimate_clicked = true;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if chip.spinner {
+                    ui.spinner();
+                }
+                if let Some(label) = &chip.label {
+                    let response = ui.label(label.clone());
+                    if let Some(tooltip) = &chip.tooltip {
+                        response.on_hover_text(tooltip);
                     }
-                    if chip.spinner {
-                        ui.spinner();
-                    }
-                    if let Some(label) = &chip.label {
-                        let response = ui.label(label.clone());
-                        if let Some(tooltip) = &chip.tooltip {
-                            response.on_hover_text(tooltip);
-                        }
-                    } else {
-                        ui.label(RichText::new("Estimated size").color(theme::MUTED));
-                    }
-                });
-            }
+                } else {
+                    ui.label(RichText::new("Estimated size…").color(theme::MUTED));
+                }
+            });
         });
-        if estimate_clicked && let Some(request) = chip.request.take() {
-            self.begin_size_estimate(request);
-        }
         let description = self.selected_custom_preset.as_ref().map_or_else(
             || self.preset.description().to_owned(),
             |name| {
@@ -2172,6 +2181,7 @@ impl App {
             self.size_estimate = None;
             self.size_measurement = None;
             self.size_measurement_request = None;
+            self.estimate_due = Some(Instant::now() + ESTIMATE_DEBOUNCE);
         }
         let label = match &self.size_estimate {
             Some(SizeEstimateState::Sampling { fraction, .. }) => Some((
@@ -2230,27 +2240,10 @@ impl App {
             Some((label, tooltip)) => (Some(label), tooltip),
             None => (None, None),
         };
-        let sampling = matches!(self.size_estimate, Some(SizeEstimateState::Sampling { .. }));
-        let encoding = self.jobs.iter().any(|job| job.state == JobState::Running);
-        let range_too_short = self.trim_end_secs - self.trim_start_secs < 0.1;
-        let blocker = self.batch_blocker();
-        let enabled = !sampling && !encoding && !range_too_short && blocker.is_none();
-        let disabled_reason = if sampling {
-            "Sampling the video…"
-        } else if encoding {
-            "Wait for the running encode to finish."
-        } else if range_too_short {
-            "The selected range is too short."
-        } else {
-            blocker.unwrap_or_default()
-        };
         EstimateChip {
             label,
             tooltip,
-            spinner: sampling,
-            enabled,
-            disabled_reason,
-            request: current,
+            spinner: matches!(self.size_estimate, Some(SizeEstimateState::Sampling { .. })),
         }
     }
 
@@ -2811,6 +2804,15 @@ fn paint_drop_overlay(context: &egui::Context) {
 fn file_drop_supported() -> bool {
     cfg!(any(target_os = "windows", target_os = "macos"))
         || std::env::var_os("WAYLAND_DISPLAY").is_none_or(|display| display.is_empty())
+}
+
+/// The display aspect of the loaded video, for sizing preview frames.
+fn display_aspect(media: &MediaInfo) -> f64 {
+    media
+        .video_stream()
+        .and_then(|video| Some(f64::from(video.width?) / f64::from(video.height?.max(1))))
+        .filter(|aspect| aspect.is_finite() && *aspect > 0.1)
+        .unwrap_or(16.0 / 9.0)
 }
 
 fn install_command() -> &'static str {

@@ -31,6 +31,7 @@ pub trait MediaEngine: Send + Sync + 'static {
         path: &Path,
         at_secs: f64,
         max_width: u32,
+        display_aspect: f64,
         fast_seek: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<PreviewFrame>;
