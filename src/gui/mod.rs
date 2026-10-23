@@ -910,11 +910,31 @@ fn panel_frame() -> egui::Frame {
         .stroke(egui::Stroke::new(1.0, theme::BORDER))
 }
 
-/// Paints the brake-disc logo: solid rotor, center bore, five rotated studs and
-/// a caliper gripping the top-left, matching the website icon. Holes are punched
-/// with the toolbar background color, which sits behind it.
+/// Logo geometry in a 120×120 box whose origin sits at the disc center minus
+/// 60, so the caliper reaches the corners. Shared by the toolbar painter and
+/// the window-icon rasterizer so they cannot drift apart. The caliper sits in
+/// front of the rotor, like on a real brake.
+const LOGO_BOX: f32 = 120.0;
+const LOGO_CENTER: f32 = 50.0;
+const LOGO_DISC_RADIUS: f32 = 46.0;
+const LOGO_BORE_RADIUS: f32 = 15.0;
+const LOGO_STUD_RING: f32 = 30.0;
+const LOGO_STUD_HOLE: f32 = 5.5;
+/// Only the studs clear of the caliper are drawn; the two it spans are hidden,
+/// as a real caliper hides the bolts behind it.
+const LOGO_STUD_HOLE_ANGLES: [f32; 3] = [126.0, 342.0, 54.0];
+const LOGO_CALIPER_RING: f32 = 45.0;
+const LOGO_CALIPER_WIDTH: f32 = 30.0;
+const LOGO_CALIPER_START: f32 = 193.0;
+const LOGO_CALIPER_SWEEP: f32 = 82.0;
+const LOGO_CALIPER_GAP: f32 = 2.5;
+const LOGO_CALIPER_COLOR: egui::Color32 = egui::Color32::from_rgb(167, 139, 250);
+
+/// Paints the brake-disc logo: solid rotor, center bore, the visible studs,
+/// and a lighter caliper gripping the front of the rotor across the top-left,
+/// separated by a thin gap punched in the panel color behind it.
 fn paint_logo(painter: &egui::Painter, rect: egui::Rect) {
-    let scale = rect.width() / 120.0;
+    let scale = rect.width() / LOGO_BOX;
     let center = rect.center();
     let at = |degrees: f32, radius: f32| {
         egui::pos2(
@@ -922,18 +942,99 @@ fn paint_logo(painter: &egui::Painter, rect: egui::Rect) {
             center.y + radius * scale * degrees.to_radians().sin(),
         )
     };
-    painter.circle_filled(center, 46.0 * scale, theme::VIOLET);
-    painter.circle_filled(center, 15.0 * scale, theme::PANEL);
-    for degrees in [126.0, 198.0, 270.0, 342.0, 54.0] {
-        painter.circle_filled(at(degrees, 30.0), 5.5 * scale, theme::PANEL);
+    let caliper_path = |steps: usize| {
+        (0..=steps)
+            .map(|step| {
+                at(
+                    LOGO_CALIPER_START + LOGO_CALIPER_SWEEP * step as f32 / steps as f32,
+                    LOGO_CALIPER_RING,
+                )
+            })
+            .collect::<Vec<egui::Pos2>>()
+    };
+    painter.circle_filled(center, LOGO_DISC_RADIUS * scale, theme::VIOLET);
+    painter.circle_filled(center, LOGO_BORE_RADIUS * scale, theme::PANEL);
+    for degrees in LOGO_STUD_HOLE_ANGLES {
+        painter.circle_filled(
+            at(degrees, LOGO_STUD_RING),
+            LOGO_STUD_HOLE * scale,
+            theme::PANEL,
+        );
     }
-    let caliper = (0..=16)
-        .map(|step| at(188.0 + 74.0 * step as f32 / 16.0, 54.0))
-        .collect();
+    let gap = (LOGO_CALIPER_WIDTH + 2.0 * LOGO_CALIPER_GAP) * scale;
     painter.add(egui::Shape::line(
-        caliper,
-        egui::Stroke::new(12.0 * scale, theme::VIOLET),
+        caliper_path(16),
+        egui::Stroke::new(gap, theme::PANEL),
     ));
+    painter.add(egui::Shape::line(
+        caliper_path(16),
+        egui::Stroke::new(LOGO_CALIPER_WIDTH * scale, LOGO_CALIPER_COLOR),
+    ));
+}
+
+/// Rasterizes the logo into RGBA pixels for the window icon, so the taskbar
+/// shows the brake disc without shipping an image alongside the binary.
+#[must_use]
+pub fn logo_rgba(size: u32) -> Vec<u8> {
+    let scale = f64::from(size) / f64::from(LOGO_BOX);
+    let cap_center = |degrees: f32| {
+        let radians = f64::from(degrees.to_radians());
+        (
+            f64::from(LOGO_CENTER) + f64::from(LOGO_CALIPER_RING) * radians.cos(),
+            f64::from(LOGO_CENTER) + f64::from(LOGO_CALIPER_RING) * radians.sin(),
+        )
+    };
+    let start_cap = cap_center(LOGO_CALIPER_START);
+    let end_cap = cap_center(LOGO_CALIPER_START + LOGO_CALIPER_SWEEP);
+    let caliper_half = f64::from(LOGO_CALIPER_WIDTH) / 2.0;
+    let gap_half = caliper_half + f64::from(LOGO_CALIPER_GAP);
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let vx = f64::from(x) / scale - 10.0;
+            let vy = f64::from(y) / scale - 10.0;
+            let distance = (vx - f64::from(LOGO_CENTER)).hypot(vy - f64::from(LOGO_CENTER));
+            let angle = ((vy - f64::from(LOGO_CENTER))
+                .atan2(vx - f64::from(LOGO_CENTER))
+                .to_degrees()
+                + 360.0)
+                % 360.0;
+            let mut solid =
+                distance <= f64::from(LOGO_DISC_RADIUS) && distance > f64::from(LOGO_BORE_RADIUS);
+            for degrees in LOGO_STUD_HOLE_ANGLES {
+                let radians = f64::from(degrees.to_radians());
+                let stud_x = f64::from(LOGO_CENTER) + f64::from(LOGO_STUD_RING) * radians.cos();
+                let stud_y = f64::from(LOGO_CENTER) + f64::from(LOGO_STUD_RING) * radians.sin();
+                solid &= (vx - stud_x).hypot(vy - stud_y) > f64::from(LOGO_STUD_HOLE);
+            }
+            let in_sweep = angle >= f64::from(LOGO_CALIPER_START)
+                && angle <= f64::from(LOGO_CALIPER_START + LOGO_CALIPER_SWEEP);
+            let on_ring = (distance - f64::from(LOGO_CALIPER_RING)).abs();
+            let caliper = (in_sweep && on_ring <= caliper_half)
+                || (vx - start_cap.0).hypot(vy - start_cap.1) <= caliper_half
+                || (vx - end_cap.0).hypot(vy - end_cap.1) <= caliper_half;
+            // A thin transparent band around the caliper separates it from the
+            // rotor, like the gap between pads and disc.
+            let gap = ((in_sweep && on_ring <= gap_half)
+                || (vx - start_cap.0).hypot(vy - start_cap.1) <= gap_half
+                || (vx - end_cap.0).hypot(vy - end_cap.1) <= gap_half)
+                && !caliper;
+            let [r, g, b, _] = if caliper {
+                LOGO_CALIPER_COLOR.to_array()
+            } else {
+                theme::VIOLET.to_array()
+            };
+            let alpha = if gap {
+                0
+            } else if solid || caliper {
+                255
+            } else {
+                0
+            };
+            rgba.extend_from_slice(&[r, g, b, alpha]);
+        }
+    }
+    rgba
 }
 
 impl App {
@@ -985,30 +1086,37 @@ impl App {
         let command = install_command();
         let mut copied = false;
         let mut recheck = false;
+        ui.add_space(48.0);
         ui.vertical_centered(|ui| {
-            ui.add_space(48.0);
             let (logo, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
             paint_logo(ui.painter(), logo);
-            ui.add_space(20.0);
+        });
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
             ui.label(
                 RichText::new("Carbon Disc needs FFmpeg")
                     .strong()
                     .size(24.0)
                     .color(Color32::WHITE),
             );
-            ui.add_space(8.0);
+        });
+        ui.add_space(8.0);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(460.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "FFmpeg does the actual encoding. Install it with your package \
-                         manager, then check again — or grab a prebuilt download, which \
-                         already includes it.",
+                        "FFmpeg does the actual encoding. Install it with your package manager, \
+                         then check again — or grab a prebuilt download, which already includes it.",
                     )
                     .color(theme::MUTED),
                 )
-                .wrap(),
+                .wrap()
+                .halign(egui::Align::Center),
             );
-            ui.add_space(18.0);
+        });
+        ui.add_space(18.0);
+        ui.vertical_centered(|ui| {
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .corner_radius(8)
@@ -1022,23 +1130,27 @@ impl App {
                         }
                     });
                 });
-            if cfg!(target_os = "linux") {
+        });
+        if cfg!(target_os = "linux") {
+            ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new("…or your distribution's package manager.")
                         .small()
                         .color(theme::MUTED),
                 );
-            }
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                if self.checking_tools {
-                    ui.spinner();
-                    ui.label(RichText::new("Looking for FFmpeg…").color(theme::MUTED));
-                } else if ui.button("Check again").clicked() {
-                    recheck = true;
-                }
             });
-            ui.add_space(12.0);
+        }
+        ui.add_space(16.0);
+        ui.vertical_centered(|ui| {
+            if self.checking_tools {
+                ui.spinner();
+                ui.label(RichText::new("Looking for FFmpeg…").color(theme::MUTED));
+            } else if ui.button("Check again").clicked() {
+                recheck = true;
+            }
+        });
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
             if let Some(path) = &self.tools_path {
                 ui.label(
                     RichText::new(format!("Looked for: {path}"))
@@ -1046,6 +1158,8 @@ impl App {
                         .color(theme::MUTED),
                 );
             }
+        });
+        ui.vertical_centered(|ui| {
             ui.label(
                 RichText::new(
                     "If it was just installed and still is not found, restart Carbon Disc.",
@@ -2869,6 +2983,45 @@ fn reveal(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logo_raster_matches_the_geometry() {
+        // At size 120 the logo box maps 1:1, offset by the -10 origin.
+        let rgba = logo_rgba(120);
+        let pixel = |vx: i32, vy: i32| {
+            let x = (vx + 10) as usize;
+            let y = (vy + 10) as usize;
+            let at = (y * 120 + x) * 4;
+            ([rgba[at], rgba[at + 1], rgba[at + 2]], rgba[at + 3])
+        };
+        assert_eq!(pixel(50, 50).1, 0, "the center bore is transparent");
+        assert_eq!(
+            pixel(90, 50),
+            ([139, 92, 246], 255),
+            "the rotor is solid violet"
+        );
+        assert_eq!(
+            pixel(18, 18),
+            ([167, 139, 250], 255),
+            "the caliper rides in front of the rotor"
+        );
+        assert_eq!(pixel(29, 29).1, 0, "a gap separates caliper and rotor");
+        assert_eq!(pixel(5, 5).1, 0, "outside the logo is transparent");
+        let hole_x = (50.0 + 30.0 * 126.0f32.to_radians().cos()) as i32;
+        let hole_y = (50.0 + 30.0 * 126.0f32.to_radians().sin()) as i32;
+        assert_eq!(
+            pixel(hole_x, hole_y).1,
+            0,
+            "visible stud holes are punched out"
+        );
+        let hidden_x = (50.0 + 30.0 * 270.0f32.to_radians().cos()) as i32;
+        let hidden_y = (50.0 + 30.0 * 270.0f32.to_radians().sin()) as i32;
+        assert_eq!(
+            pixel(hidden_x, hidden_y).1,
+            255,
+            "the caliper hides the studs behind it"
+        );
+    }
 
     #[test]
     fn timecodes_parse_in_common_forms() {

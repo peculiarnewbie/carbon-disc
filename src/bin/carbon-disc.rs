@@ -34,11 +34,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    const ICON_SIZE: u32 = 128;
+    let icon = eframe::egui::IconData {
+        rgba: carbon_disc::gui::logo_rgba(ICON_SIZE),
+        width: ICON_SIZE,
+        height: ICON_SIZE,
+    };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Carbon Disc")
             .with_inner_size([1360.0, 900.0])
-            .with_min_inner_size([960.0, 600.0]),
+            .with_min_inner_size([960.0, 600.0])
+            .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
     eframe::run_native(
