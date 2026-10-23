@@ -58,6 +58,16 @@ enum SizeEstimateState {
     Failed(String),
 }
 
+/// Everything the top-right estimate chip needs to render and act.
+struct EstimateChip {
+    label: Option<RichText>,
+    tooltip: Option<String>,
+    spinner: bool,
+    enabled: bool,
+    disabled_reason: &'static str,
+    request: Option<EncodeRequest>,
+}
+
 /// A job waiting on the "replace existing file?" confirmation.
 struct PendingAdd {
     request: EncodeRequest,
@@ -1366,10 +1376,7 @@ impl App {
         );
         let mut tools = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_center_size(
-                    strip.center(),
-                    egui::vec2(width.max(360.0).min(strip.width()), strip.height()),
-                ))
+                .max_rect(strip)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         if let Some((source_width, source_height)) = source_size {
@@ -1414,7 +1421,31 @@ impl App {
                 );
             }
         }
-        tools.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let mut chip = self.estimate_chip();
+        let mut estimate_clicked = false;
+        let mut corner = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(strip)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        corner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(label) = &chip.label {
+                let response = ui.label(label.clone());
+                if let Some(tooltip) = &chip.tooltip {
+                    response.on_hover_text(tooltip);
+                }
+            }
+            if chip.spinner {
+                ui.spinner();
+            }
+            if ui
+                .add_enabled(chip.enabled, egui::Button::new("Estimate").small())
+                .on_hover_text("Encode short samples of this video to project its size")
+                .on_disabled_hover_text(chip.disabled_reason)
+                .clicked()
+            {
+                estimate_clicked = true;
+            }
             ui.label(
                 RichText::new(format!(
                     "{} / {}",
@@ -1428,6 +1459,9 @@ impl App {
                 ui.spinner();
             }
         });
+        if estimate_clicked && let Some(request) = chip.request.take() {
+            self.begin_size_estimate(request);
+        }
         ui.add_space(6.0);
 
         let (row, _) = ui.allocate_exact_size(
@@ -1589,8 +1623,6 @@ impl App {
                     Tab::Audio => self.audio_ui(ui),
                     Tab::Picture => self.picture_ui(ui),
                 }
-                ui.add_space(14.0);
-                self.size_estimate_ui(ui);
             });
     }
 
@@ -2124,22 +2156,20 @@ impl App {
     /// A row under the settings tabs showing the projected output size. A measurement
     /// survives quality, range, and audio edits — those derive instantly — while any
     /// other change to the encode invalidates it.
-    fn size_estimate_ui(&mut self, ui: &mut egui::Ui) {
+    /// Computes the estimate chip's state, clearing a measurement that no
+    /// longer applies to the current request.
+    fn estimate_chip(&mut self) -> EstimateChip {
         let current = self.build_request();
-        let derivation = match (&self.size_measurement_request, &current) {
-            (Some(previous), Some(next)) => Some(size_derivation(previous, next)),
-            (Some(_), None) => Some(SizeDerivation::Invalid),
-            (None, _) => None,
-        };
-        if derivation == Some(SizeDerivation::Invalid) {
+        if let Some(previous) = &self.size_measurement_request
+            && current
+                .as_ref()
+                .is_none_or(|request| size_derivation(previous, request) == SizeDerivation::Invalid)
+        {
             self.size_estimate = None;
             self.size_measurement = None;
             self.size_measurement_request = None;
         }
-        let Some(request) = current else {
-            return;
-        };
-        let view = match &self.size_estimate {
+        let label = match &self.size_estimate {
             Some(SizeEstimateState::Sampling { fraction, .. }) => Some((
                 RichText::new(format!("Sampling… {:.0}%", fraction * 100.0)).color(theme::MUTED),
                 None,
@@ -2149,25 +2179,32 @@ impl App {
                     .size_measurement
                     .as_ref()
                     .expect("a measured estimate always has its measurement");
-                let total = measurement.estimate_for(&request).total_bytes();
-                let (text, tooltip) = if derivation == Some(SizeDerivation::Same) {
-                    (
-                        format!("≈ {}", bytes(total)),
-                        "Measured with short sample encodes at these settings; the real size still varies with the content.".to_owned(),
-                    )
-                } else {
-                    (
-                        format!("≈ {}*", bytes(total)),
-                        format!(
-                            "Derived from the measurement at Q{}; press Estimate to re-measure.",
-                            measurement.quality
+                current.as_ref().map(|request| {
+                    let total = measurement.estimate_for(request).total_bytes();
+                    match current
+                        .as_ref()
+                        .and_then(|request| self.size_measurement_request.as_ref().map(|previous| size_derivation(previous, request)))
+                    {
+                        Some(SizeDerivation::Same) => (
+                            RichText::new(format!("≈ {}", bytes(total)))
+                                .strong()
+                                .color(Color32::WHITE),
+                            Some(
+                                "Measured with short sample encodes at these settings; the real size still varies with the content."
+                                    .to_owned(),
+                            ),
                         ),
-                    )
-                };
-                Some((
-                    RichText::new(text).strong().color(Color32::WHITE),
-                    Some(tooltip),
-                ))
+                        _ => (
+                            RichText::new(format!("≈ {}*", bytes(total)))
+                                .strong()
+                                .color(Color32::WHITE),
+                            Some(format!(
+                                "Derived from the measurement at Q{}; press Estimate to re-measure.",
+                                measurement.quality
+                            )),
+                        ),
+                    }
+                })
             }
             Some(SizeEstimateState::Failed(message)) => Some((
                 RichText::new("Estimate unavailable")
@@ -2176,6 +2213,10 @@ impl App {
                 Some(message.clone()),
             )),
             None => None,
+        };
+        let (label, tooltip) = match label {
+            Some((label, tooltip)) => (Some(label), tooltip),
+            None => (None, None),
         };
         let sampling = matches!(self.size_estimate, Some(SizeEstimateState::Sampling { .. }));
         let encoding = self.jobs.iter().any(|job| job.state == JobState::Running);
@@ -2191,32 +2232,13 @@ impl App {
         } else {
             blocker.unwrap_or_default()
         };
-        let mut start = false;
-        field_row(ui, "Estimated size", |ui| {
-            ui.horizontal(|ui| {
-                if sampling {
-                    ui.spinner();
-                }
-                if let Some((text, tooltip)) = &view {
-                    let label = ui.label(text.clone());
-                    if let Some(tooltip) = tooltip {
-                        label.on_hover_text(tooltip);
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("Estimate"))
-                        .on_hover_text("Encode short samples of this video to project its size")
-                        .on_disabled_hover_text(disabled_reason)
-                        .clicked()
-                    {
-                        start = true;
-                    }
-                });
-            });
-        });
-        if start {
-            self.begin_size_estimate(request);
+        EstimateChip {
+            label,
+            tooltip,
+            spinner: sampling,
+            enabled,
+            disabled_reason,
+            request: current,
         }
     }
 

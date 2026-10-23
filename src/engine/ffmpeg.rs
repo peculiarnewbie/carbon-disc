@@ -1362,9 +1362,8 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-ss", "12.346"]));
         assert!(args.iter().any(|arg| arg == "-noaccurate_seek"));
         assert!(
-            args.windows(2).any(|pair| {
-                pair == ["-vf", "scale=640:'trunc(if(gt(dar,0),640/dar,ih)/2)*2'"]
-            })
+            args.windows(2)
+                .any(|pair| { pair == ["-vf", "scale=640:'trunc(if(gt(dar,0),640/dar,ih)/2)*2'"] })
         );
         assert!(args.windows(2).any(|pair| pair == ["-vcodec", "ppm"]));
     }
