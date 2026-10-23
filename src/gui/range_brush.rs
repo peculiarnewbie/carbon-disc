@@ -52,7 +52,10 @@ pub fn show(
     // hit-test the press position. The pointer may travel far past the handle
     // before egui reports the drag as started, so testing the current pointer
     // position here would silently turn every normal-speed grab into a scrub.
-    if grab.is_none() && button_down && let Some(origin) = press_position(ui, &response) {
+    if grab.is_none()
+        && button_down
+        && let Some(origin) = press_position(ui, &response)
+    {
         let part = hit_test(origin, start_x, end_x);
         grab = Some(GrabState {
             part,
@@ -66,7 +69,8 @@ pub fn show(
     if let Some(grab) = grab
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        match grab.part {            DragPart::Start => {
+        match grab.part {
+            DragPart::Start => {
                 let offset_secs =
                     f64::from((pointer.x - grab.origin_x) / track.width()) * duration_secs;
                 *start_secs =
@@ -111,7 +115,10 @@ pub fn show(
     let playhead_x = time_to_x(*playhead_secs, duration_secs, track);
 
     let over_handle = response.hover_pos().is_some_and(|pointer| {
-        matches!(hit_test(pointer, start_x, end_x), DragPart::Start | DragPart::End)
+        matches!(
+            hit_test(pointer, start_x, end_x),
+            DragPart::Start | DragPart::End
+        )
     });
     response = response.on_hover_cursor(if over_handle {
         CursorIcon::ResizeHorizontal
@@ -158,7 +165,8 @@ pub fn show(
 /// Where the pointer went down for the press currently held on this widget, or
 /// where the pointer is when no press origin is known.
 fn press_position(ui: &egui::Ui, response: &Response) -> Option<Pos2> {
-    ui.input(|input| input.pointer.press_origin()).or_else(|| response.interact_pointer_pos())
+    ui.input(|input| input.pointer.press_origin())
+        .or_else(|| response.interact_pointer_pos())
 }
 
 fn hit_test(pointer: Pos2, start_x: f32, end_x: f32) -> DragPart {
@@ -253,7 +261,11 @@ mod tests {
             let ctx = Context::default();
             ctx.set_pixels_per_point(1.0);
             let time = 0.0;
-            let mut harness = Self { ctx, time, rect: Rect::NOTHING };
+            let mut harness = Self {
+                ctx,
+                time,
+                rect: Rect::NOTHING,
+            };
             // First pass only to learn where the brush lands.
             let mut probe = state();
             harness.pass(Vec::new(), &mut probe);
@@ -263,10 +275,7 @@ mod tests {
         fn pass(&mut self, events: Vec<Event>, state: &mut State) -> Response {
             let input = RawInput {
                 viewport_id: ViewportId::ROOT,
-                screen_rect: Some(Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(600.0, 200.0),
-                )),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 200.0))),
                 time: Some(self.time),
                 events,
                 ..RawInput::default()
@@ -337,12 +346,20 @@ mod tests {
         fn track_point(&self, fraction: f32) -> Pos2 {
             let left = self.rect.left() + 10.0;
             let right = self.rect.right() - 10.0;
-            Pos2::new(egui::lerp(left..=right, fraction), self.rect.bottom() - 17.0)
+            Pos2::new(
+                egui::lerp(left..=right, fraction),
+                self.rect.bottom() - 17.0,
+            )
         }
     }
 
     fn state() -> State {
-        State { start: 0.0, end: 100.0, playhead: 0.0, duration: 100.0 }
+        State {
+            start: 0.0,
+            end: 100.0,
+            playhead: 0.0,
+            duration: 100.0,
+        }
     }
 
     /// Pressing on the trim handle and dragging right must move the start of
@@ -356,7 +373,11 @@ mod tests {
         harness.press(harness.start_handle(), &mut state);
         harness.move_to(harness.track_point(0.25), &mut state);
         harness.release(harness.track_point(0.25), &mut state);
-        assert!(state.start > 20.0 && state.start < 30.0, "start moved to {}", state.start);
+        assert!(
+            state.start > 20.0 && state.start < 30.0,
+            "start moved to {}",
+            state.start
+        );
         assert!((state.playhead - state.start).abs() < 1e-9);
     }
 
@@ -385,12 +406,21 @@ mod tests {
     #[test]
     fn grabbing_the_knob_over_a_handle_trims() {
         let mut harness = Harness::new();
-        let mut state = State { start: 20.0, end: 80.0, playhead: 20.0, duration: 100.0 };
+        let mut state = State {
+            start: 20.0,
+            end: 80.0,
+            playhead: 20.0,
+            duration: 100.0,
+        };
         let knob = harness.playhead_knob(&state);
         harness.press(knob, &mut state);
         harness.move_to(harness.track_point(0.4), &mut state);
         harness.release(harness.track_point(0.4), &mut state);
-        assert!(state.start > 30.0, "start handle should move, got {}", state.start);
+        assert!(
+            state.start > 30.0,
+            "start handle should move, got {}",
+            state.start
+        );
         assert!((state.playhead - state.start).abs() < 1e-9);
     }
 
@@ -419,7 +449,11 @@ mod tests {
         harness.press(harness.end_handle(), &mut state);
         harness.move_to(harness.track_point(0.6), &mut state);
         harness.release(harness.track_point(0.6), &mut state);
-        assert!(state.end > 55.0 && state.end < 65.0, "end moved to {}", state.end);
+        assert!(
+            state.end > 55.0 && state.end < 65.0,
+            "end moved to {}",
+            state.end
+        );
         assert!((state.playhead - (state.end - 0.1)).abs() < 1e-9);
     }
 }
