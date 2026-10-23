@@ -11,5 +11,6 @@ pub use engine::{EngineEvent, MediaEngine};
 pub use error::{Error, Result};
 pub use model::{
     AudioTrackSettings, CropMargins, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
-    EngineCapabilities, MediaInfo, Preset, PreviewFrame,
+    EngineCapabilities, MediaInfo, Preset, PreviewFrame, SizeDerivation, SizeEstimate,
+    SizeMeasurement, size_derivation,
 };

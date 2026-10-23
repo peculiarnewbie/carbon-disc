@@ -19,6 +19,99 @@ pub struct PreviewFrame {
     pub rgba: Vec<u8>,
 }
 
+/// A pre-encode estimate of the output size at one set of settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeEstimate {
+    /// Video bytes at the requested quality.
+    pub video_bytes: u64,
+    /// Audio bytes: measured passthrough plus exactly computed re-encoded tracks.
+    pub audio_bytes: u64,
+}
+
+impl SizeEstimate {
+    #[must_use]
+    pub const fn total_bytes(self) -> u64 {
+        self.video_bytes + self.audio_bytes
+    }
+}
+
+/// Size rates measured by sample encodes. Estimates at other quality, range, or
+/// audio settings are derived from these without encoding again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizeMeasurement {
+    /// Video bytes per output second at `quality`.
+    pub video_bytes_per_second: f64,
+    /// Passthrough-audio bytes per output second (zero when audio is re-encoded).
+    pub copy_audio_bytes_per_second: f64,
+    /// The video quality `video_bytes_per_second` was measured at.
+    pub quality: u8,
+    /// Quality steps that halve video size on this content and encoder. The QP
+    /// scales halve per six steps in theory; this is measured on the actual video.
+    pub quality_halving_steps: f64,
+}
+
+impl SizeMeasurement {
+    /// The estimate for a request whose encoder, speed, and picture settings match
+    /// the measurement; only quality, range, and audio settings may differ.
+    #[must_use]
+    pub fn estimate_for(&self, request: &EncodeRequest) -> SizeEstimate {
+        let duration = request.output_duration_secs();
+        let shift = f64::from(self.quality) - f64::from(request.settings.quality);
+        let scale = 2f64.powf(shift / self.quality_halving_steps.max(1.0));
+        SizeEstimate {
+            video_bytes: (self.video_bytes_per_second * scale * duration).round() as u64,
+            audio_bytes: (self.copy_audio_bytes_per_second * duration).round() as u64
+                + request.reencoded_audio_bytes(),
+        }
+    }
+}
+
+/// Whether a measurement taken for one request still applies to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeDerivation {
+    /// The request matches the measurement exactly.
+    Same,
+    /// Only quality, range, or audio settings changed, so the estimate is derived
+    /// from the measurement without new sample encodes.
+    Derived,
+    /// A different encode entirely; the measurement no longer applies.
+    Invalid,
+}
+
+#[must_use]
+pub fn size_derivation(measured: &EncodeRequest, next: &EncodeRequest) -> SizeDerivation {
+    let (was, now) = (&measured.settings, &next.settings);
+    let different_encode = measured.input != next.input
+        || measured.source_duration_secs != next.source_duration_secs
+        || was.video_encoder != now.video_encoder
+        || was.speed != now.speed
+        || was.container != now.container
+        || was.max_width != now.max_width
+        || was.max_height != now.max_height
+        || was.crop != now.crop;
+    if different_encode {
+        return SizeDerivation::Invalid;
+    }
+    // Passthrough audio is measured, so a different track selection or codec
+    // cannot be derived; re-encoded audio is exact math and always can.
+    let passthrough_changed = (was.audio_encoder == AudioEncoder::Copy
+        || now.audio_encoder == AudioEncoder::Copy)
+        && (measured.audio_tracks != next.audio_tracks || was.audio_encoder != now.audio_encoder);
+    if passthrough_changed {
+        return SizeDerivation::Invalid;
+    }
+    if was.quality != now.quality
+        || measured.range != next.range
+        || measured.audio_tracks != next.audio_tracks
+        || was.audio_encoder != now.audio_encoder
+        || was.audio_bitrate_kbps != now.audio_bitrate_kbps
+    {
+        SizeDerivation::Derived
+    } else {
+        SizeDerivation::Same
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CustomPreset {
     pub name: String,
@@ -153,6 +246,19 @@ impl EncodeRequest {
     #[must_use]
     pub fn output_duration_secs(&self) -> f64 {
         self.range.duration_secs(self.source_duration_secs)
+    }
+
+    /// Exact size of the re-encoded AAC/Opus tracks at their bitrates. Passthrough
+    /// audio is excluded: its size is whatever the source holds, so the engine
+    /// measures it with the sample encodes instead.
+    #[must_use]
+    pub fn reencoded_audio_bytes(&self) -> u64 {
+        let seconds = self.output_duration_secs();
+        self.audio_tracks
+            .iter()
+            .filter(|track| track.encoder != AudioEncoder::Copy)
+            .map(|track| f64::from(track.bitrate_kbps) * 125.0 * seconds)
+            .sum::<f64>() as u64
     }
 }
 
@@ -563,6 +669,123 @@ impl Preset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn estimate_fixture(input: &str, quality: u8) -> EncodeRequest {
+        EncodeRequest {
+            input: input.into(),
+            output: "clip.mp4".into(),
+            source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: EncodeRange::ALL,
+            audio_tracks: vec![AudioTrackSettings {
+                source_index: 1,
+                encoder: AudioEncoder::Aac,
+                bitrate_kbps: 128,
+            }],
+            overwrite: false,
+            settings: EncodeSettings {
+                quality,
+                ..EncodeSettings::default()
+            },
+        }
+    }
+
+    #[test]
+    fn estimates_derive_across_quality_and_range() {
+        let measurement = SizeMeasurement {
+            video_bytes_per_second: 1_000_000.0,
+            copy_audio_bytes_per_second: 0.0,
+            quality: 21,
+            quality_halving_steps: 6.0,
+        };
+        // +6 quality steps halve the video; audio stays exact.
+        let mut higher = estimate_fixture("source.mkv", 27);
+        higher.range = EncodeRange::new(0.0, 30.0);
+        let estimate = measurement.estimate_for(&higher);
+        let audio = 128 * 125 * 30;
+        assert!((estimate.video_bytes as f64 - 15_000_000.0).abs() < 1_000.0);
+        assert_eq!(estimate.audio_bytes, audio);
+        assert_eq!(estimate.total_bytes(), estimate.video_bytes + audio);
+    }
+
+    #[test]
+    fn measured_passthrough_audio_scales_with_duration() {
+        let measurement = SizeMeasurement {
+            video_bytes_per_second: 500_000.0,
+            copy_audio_bytes_per_second: 16_000.0,
+            quality: 21,
+            quality_halving_steps: 6.0,
+        };
+        let mut clipped = estimate_fixture("source.mkv", 21);
+        clipped.range = EncodeRange::new(10.0, 40.0);
+        let estimate = measurement.estimate_for(&clipped);
+        // Measured passthrough (16,000 B/s) plus the fixture's exact 128 kb/s track.
+        assert_eq!(estimate.audio_bytes, 16_000 * 30 + 128 * 125 * 30);
+    }
+
+    #[test]
+    fn derivation_classifies_request_changes() {
+        let measured = estimate_fixture("source.mkv", 21);
+        assert_eq!(
+            size_derivation(&measured, &estimate_fixture("source.mkv", 21)),
+            SizeDerivation::Same
+        );
+        assert_eq!(
+            size_derivation(&measured, &estimate_fixture("source.mkv", 28)),
+            SizeDerivation::Derived
+        );
+        let mut other_file = estimate_fixture("movie.mkv", 21);
+        other_file.source_duration_secs = 120.0;
+        assert_eq!(
+            size_derivation(&measured, &other_file),
+            SizeDerivation::Invalid
+        );
+        let mut other_encoder = estimate_fixture("source.mkv", 21);
+        other_encoder.settings.video_encoder = VideoEncoder::H265;
+        assert_eq!(
+            size_derivation(&measured, &other_encoder),
+            SizeDerivation::Invalid
+        );
+        // Re-encoded audio changes derive; passthrough changes do not.
+        let mut louder = estimate_fixture("source.mkv", 21);
+        louder.settings.audio_bitrate_kbps = 256;
+        assert_eq!(size_derivation(&measured, &louder), SizeDerivation::Derived);
+        let mut passthrough = estimate_fixture("source.mkv", 21);
+        passthrough.settings.audio_encoder = AudioEncoder::Copy;
+        assert_eq!(
+            size_derivation(&measured, &passthrough),
+            SizeDerivation::Invalid
+        );
+    }
+
+    #[test]
+    fn reencoded_audio_size_is_exact_and_skips_passthrough() {
+        let request = EncodeRequest {
+            input: "source.mkv".into(),
+            output: "clip.mp4".into(),
+            source_duration_secs: 60.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: EncodeRange::ALL,
+            audio_tracks: vec![
+                AudioTrackSettings {
+                    source_index: 1,
+                    encoder: AudioEncoder::Aac,
+                    bitrate_kbps: 192,
+                },
+                AudioTrackSettings {
+                    source_index: 2,
+                    encoder: AudioEncoder::Copy,
+                    bitrate_kbps: 0,
+                },
+            ],
+            overwrite: false,
+            settings: EncodeSettings::default(),
+        };
+        // 192 kb/s for one minute, plus nothing for the passthrough track.
+        assert_eq!(request.reencoded_audio_bytes(), 1_440_000);
+    }
 
     #[test]
     fn rejects_an_inverted_encode_range() {

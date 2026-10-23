@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use crate::{CropMargins, EncodeRequest, EngineCapabilities, MediaInfo, PreviewFrame, Result};
+use crate::{
+    CropMargins, EncodeRequest, EngineCapabilities, MediaInfo, PreviewFrame, Result,
+    SizeMeasurement,
+};
 
 pub mod ffmpeg;
 
@@ -40,6 +43,16 @@ pub trait MediaEngine: Send + Sync + 'static {
         width: u32,
         height: u32,
     ) -> Result<CropMargins>;
+    /// Measures output size rates before encoding. Quality-based rate control
+    /// makes video size content-dependent, so this encodes short samples spread
+    /// across the requested range; estimates at other quality, range, or audio
+    /// settings are then derived from the measurement without new encodes.
+    fn estimate_size(
+        &self,
+        request: &EncodeRequest,
+        cancelled: Arc<AtomicBool>,
+        emit: &mut dyn FnMut(EngineEvent),
+    ) -> Result<SizeMeasurement>;
     fn encode(
         &self,
         request: &EncodeRequest,

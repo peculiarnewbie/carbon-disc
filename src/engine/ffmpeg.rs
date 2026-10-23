@@ -15,7 +15,8 @@ use std::{
 use serde::Deserialize;
 
 use crate::{
-    CropMargins, EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame, Result,
+    CropMargins, EncodeRange, EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame,
+    Result, SizeMeasurement,
     model::{AudioEncoder, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
 };
 
@@ -322,6 +323,160 @@ impl FfmpegEngine {
             }
         }
     }
+
+    /// Encodes one sample segment to `output` and reports its size and duration.
+    fn run_sample(
+        &self,
+        request: &EncodeRequest,
+        output: &Path,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<(u64, f64)> {
+        let mut child = Command::new(&self.ffmpeg)
+            .args(Self::encode_args_for_output(request, output))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|source| Error::Launch {
+                program: self.ffmpeg.clone(),
+                source,
+            })?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::Process {
+            program: self.ffmpeg.display().to_string(),
+            message: "progress pipe was unavailable".into(),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| Error::Process {
+            program: self.ffmpeg.display().to_string(),
+            message: "diagnostic pipe was unavailable".into(),
+        })?;
+        let stderr_thread = thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut text);
+            text
+        });
+        // The requested sample length is only nominal: seeking lands on a keyframe, so
+        // the encoded duration is read back from FFmpeg's own progress output.
+        let mut out_secs = 0.0;
+        for line in BufReader::new(stdout).lines() {
+            if cancelled.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_thread.join();
+                return Err(Error::Cancelled);
+            }
+            let line = line?;
+            if let Some((key, value)) = line.split_once('=')
+                && key == "out_time_us"
+                && let Ok(micros) = value.parse::<f64>()
+            {
+                out_secs = micros / 1_000_000.0;
+            }
+        }
+        while child.try_wait()?.is_none() {
+            if cancelled.load(Ordering::Relaxed) {
+                let _ = child.kill();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let status = child.wait()?;
+        let stderr = stderr_thread
+            .join()
+            .unwrap_or_else(|_| "FFmpeg diagnostic reader failed".into());
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        if !status.success() {
+            return Err(Error::Process {
+                program: self.ffmpeg.display().to_string(),
+                message: tail(&stderr, 20),
+            });
+        }
+        let size = std::fs::metadata(output).map_or(0, |metadata| metadata.len());
+        Ok((size, out_secs))
+    }
+
+    /// Sums the encoded video packet sizes in a sample output, so video bytes can
+    /// be separated from passthrough audio muxed into the same file.
+    fn video_packet_bytes(&self, path: &Path) -> Result<u64> {
+        let output = Command::new(&self.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "packet=size",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .map_err(|source| Error::Launch {
+                program: self.ffprobe.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(Error::Process {
+                program: self.ffprobe.display().to_string(),
+                message: tail(&String::from_utf8_lossy(&output.stderr), 5),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u64>().ok())
+            .sum())
+    }
+
+    /// Measures how many quality steps halve the video size, by re-encoding one
+    /// already-measured segment at a shifted quality. Same content, same encoder:
+    /// the size ratio is this video's own quality→size curve. Anything unexpected
+    /// falls back to the theoretical QP-scale default instead of failing.
+    fn calibrate_quality_steps(
+        &self,
+        request: &EncodeRequest,
+        segment: (f64, f64),
+        segment_video_bytes: u64,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<f64> {
+        let range = request.settings.video_encoder.quality_range();
+        let quality = i16::from(request.settings.quality);
+        // Shift towards smaller files, which also encodes faster.
+        let shift: i16 = if request.settings.video_encoder.higher_quality_is_better() {
+            -20
+        } else {
+            6
+        };
+        let mut probe = quality + shift;
+        if !range.contains(&(probe.clamp(i16::from(*range.start()), i16::from(*range.end())) as u8))
+        {
+            probe = quality - shift;
+        }
+        probe = probe.clamp(i16::from(*range.start()), i16::from(*range.end()));
+        if probe == quality || segment_video_bytes == 0 {
+            return Ok(DEFAULT_QUALITY_STEPS);
+        }
+        let mut sample = sample_request(request, segment.0, segment.1);
+        sample.settings.quality = probe as u8;
+        sample.audio_tracks.clear();
+        let output = std::env::temp_dir().join(format!(
+            "carbon-disc-estimate-{}-calibration.{}",
+            std::process::id(),
+            request.settings.container.extension(),
+        ));
+        let result = self.run_sample(&sample, &output, cancelled);
+        let _ = std::fs::remove_file(&output);
+        let (probe_bytes, _) = match result {
+            Ok(measured) if measured.0 > 0 && measured.1 > 0.1 => measured,
+            Ok(_) => return Ok(DEFAULT_QUALITY_STEPS),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(_) => return Ok(DEFAULT_QUALITY_STEPS),
+        };
+        let ratio = segment_video_bytes as f64 / probe_bytes as f64;
+        if ratio <= 1.02 {
+            return Ok(DEFAULT_QUALITY_STEPS);
+        }
+        Ok(((quality - probe).unsigned_abs() as f64 / ratio.log2()).clamp(3.0, 24.0))
+    }
 }
 
 impl MediaEngine for FfmpegEngine {
@@ -485,6 +640,84 @@ impl MediaEngine for FfmpegEngine {
         Ok(combined.unwrap_or(CropMargins::ZERO))
     }
 
+    fn estimate_size(
+        &self,
+        request: &EncodeRequest,
+        cancelled: Arc<AtomicBool>,
+        emit: &mut dyn FnMut(EngineEvent),
+    ) -> Result<SizeMeasurement> {
+        request.range.validate(request.source_duration_secs)?;
+        let segments = sample_segments(request.range, request.source_duration_secs);
+        let passthrough = request
+            .audio_tracks
+            .iter()
+            .any(|track| track.encoder == AudioEncoder::Copy);
+        let mut video_bytes = 0u64;
+        let mut copy_bytes = 0u64;
+        let mut seconds = 0.0;
+        let mut calibration: Option<((f64, f64), u64)> = None;
+        let steps = segments.len() + 1;
+        for (index, (start, length)) in segments.iter().enumerate() {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let sample = sample_request(request, *start, *length);
+            let output = std::env::temp_dir().join(format!(
+                "carbon-disc-estimate-{}-{index}.{}",
+                std::process::id(),
+                request.settings.container.extension(),
+            ));
+            let result = self.run_sample(&sample, &output, &cancelled);
+            // Video bytes must be separated from muxed passthrough audio before the
+            // file is deleted, because only video follows the quality scale.
+            let sample_video = match &result {
+                Ok((sample_bytes, _)) if passthrough => {
+                    self.video_packet_bytes(&output).unwrap_or(*sample_bytes)
+                }
+                Ok((sample_bytes, _)) => *sample_bytes,
+                Err(_) => 0,
+            };
+            let _ = std::fs::remove_file(&output);
+            let (sample_bytes, sample_secs) = result?;
+            if sample_bytes > 0 && sample_secs > 0.1 {
+                video_bytes += sample_video;
+                copy_bytes += sample_bytes - sample_video;
+                seconds += sample_secs;
+                if index == segments.len() / 2 {
+                    calibration = Some(((*start, *length), sample_video));
+                }
+            }
+            emit(EngineEvent::Progress {
+                fraction: (index + 1) as f32 / steps as f32,
+                frame: None,
+                speed: None,
+            });
+        }
+        if seconds < 0.1 {
+            return Err(Error::Process {
+                program: self.ffmpeg.display().to_string(),
+                message: "the sample encodes produced no output".into(),
+            });
+        }
+        let quality_halving_steps = match calibration {
+            Some((segment, segment_video_bytes)) => {
+                self.calibrate_quality_steps(request, segment, segment_video_bytes, &cancelled)?
+            }
+            None => DEFAULT_QUALITY_STEPS,
+        };
+        emit(EngineEvent::Progress {
+            fraction: 1.0,
+            frame: None,
+            speed: None,
+        });
+        Ok(SizeMeasurement {
+            video_bytes_per_second: video_bytes as f64 / seconds,
+            copy_audio_bytes_per_second: copy_bytes as f64 / seconds,
+            quality: request.settings.quality,
+            quality_halving_steps,
+        })
+    }
+
     fn encode(
         &self,
         request: &EncodeRequest,
@@ -631,6 +864,47 @@ impl Drop for TemporaryOutput {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Sample encodes are short: long enough to ride out keyframe overhead, few enough
+/// that estimating never costs more than a few seconds of real encoding.
+const SAMPLE_SECS: f64 = 8.0;
+const MAX_SAMPLES: usize = 5;
+/// QP quantizers double every six steps, so quality scaling falls back to this
+/// when the per-video calibration sample cannot run.
+const DEFAULT_QUALITY_STEPS: f64 = 6.0;
+
+/// Segments (start, seconds) to encode for a size estimate, spread across the
+/// requested range. A range no longer than one sample is measured in full, which
+/// makes the estimate exact.
+fn sample_segments(range: EncodeRange, source_duration_secs: f64) -> Vec<(f64, f64)> {
+    let duration = range.duration_secs(source_duration_secs);
+    if duration <= SAMPLE_SECS {
+        return vec![(range.start_secs, duration)];
+    }
+    let span = duration - SAMPLE_SECS;
+    let count = ((duration / (SAMPLE_SECS * 4.0)) as usize).clamp(1, MAX_SAMPLES);
+    (0..count)
+        .map(|index| {
+            let fraction = if count == 1 {
+                0.5
+            } else {
+                index as f64 / (count - 1) as f64
+            };
+            (range.start_secs + span * fraction, SAMPLE_SECS)
+        })
+        .collect()
+}
+
+/// A copy of the request covering one sample segment, stripped of re-encoded audio
+/// (which is sized exactly from its bitrate instead of sampled).
+fn sample_request(request: &EncodeRequest, start: f64, length: f64) -> EncodeRequest {
+    let mut sample = request.clone();
+    sample
+        .audio_tracks
+        .retain(|track| track.encoder == AudioEncoder::Copy);
+    sample.range = EncodeRange::new(start, start + length);
+    sample
 }
 
 fn progress_event(values: &HashMap<String, String>, duration_secs: f64) -> EngineEvent {
@@ -1033,6 +1307,68 @@ mod tests {
             "carbon-disc-{label}-{}-{nanos}.mp4",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn size_samples_cover_short_ranges_in_full() {
+        assert_eq!(
+            sample_segments(crate::EncodeRange::new(2.0, 6.0), 6.0),
+            vec![(2.0, 4.0)]
+        );
+        assert_eq!(
+            sample_segments(crate::EncodeRange::ALL, 5.0),
+            vec![(0.0, 5.0)]
+        );
+    }
+
+    #[test]
+    fn size_samples_spread_across_long_ranges_and_stay_inside() {
+        let segments = sample_segments(crate::EncodeRange::new(100.0, 400.0), 400.0);
+        assert_eq!(segments.len(), MAX_SAMPLES);
+        for (start, length) in &segments {
+            assert!(*start >= 100.0 && start + length <= 400.0);
+        }
+        assert_eq!(segments.first(), Some(&(100.0, SAMPLE_SECS)));
+        assert_eq!(segments.last(), Some(&(392.0, SAMPLE_SECS)));
+        // A range that only fits a few whole samples gets that many.
+        assert_eq!(
+            sample_segments(crate::EncodeRange::new(0.0, 100.0), 100.0),
+            vec![(0.0, 8.0), (46.0, 8.0), (92.0, 8.0)]
+        );
+    }
+
+    #[test]
+    fn size_sample_request_measures_passthrough_audio_but_not_reencoded() {
+        let request = EncodeRequest {
+            input: "in.mkv".into(),
+            output: "out.mp4".into(),
+            source_duration_secs: 120.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: crate::EncodeRange::ALL,
+            audio_tracks: vec![
+                crate::AudioTrackSettings {
+                    source_index: 1,
+                    encoder: AudioEncoder::Aac,
+                    bitrate_kbps: 192,
+                },
+                crate::AudioTrackSettings {
+                    source_index: 2,
+                    encoder: AudioEncoder::Copy,
+                    bitrate_kbps: 0,
+                },
+            ],
+            overwrite: false,
+            settings: EncodeSettings::default(),
+        };
+        let sample = sample_request(&request, 12.0, 8.0);
+        assert_eq!(sample.audio_tracks.len(), 1);
+        assert_eq!(sample.audio_tracks[0].source_index, 2);
+        let args = FfmpegEngine::encode_args(&sample);
+        assert!(args.windows(2).any(|pair| pair == ["-ss", "12.000"]));
+        assert!(args.windows(2).any(|pair| pair == ["-t", "8.000"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:a:0", "copy"]));
+        assert!(!args.iter().any(|arg| arg == "-c:a:1"));
     }
 
     #[test]

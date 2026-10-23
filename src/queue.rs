@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     AudioTrackSettings, EncodeRange, EncodeRequest, EncodeSettings, EngineCapabilities,
-    MediaEngine, MediaInfo, PreviewFrame, engine::EngineEvent,
+    MediaEngine, MediaInfo, PreviewFrame, SizeMeasurement, engine::EngineEvent,
 };
 
 pub type JobId = u64;
@@ -51,6 +51,10 @@ pub enum Command {
         width: u32,
         height: u32,
     },
+    EstimateSize {
+        id: u64,
+        request: EncodeRequest,
+    },
     BatchFiles {
         paths: Vec<PathBuf>,
         settings: EncodeSettings,
@@ -82,6 +86,14 @@ pub enum Event {
     },
     Capabilities(Result<EngineCapabilities, String>),
     CropDetected(Result<crate::CropMargins, String>),
+    SizeEstimateProgress {
+        id: u64,
+        fraction: f32,
+    },
+    SizeEstimateFinished {
+        id: u64,
+        result: Result<SizeMeasurement, String>,
+    },
     BatchProgress {
         current: usize,
         total: usize,
@@ -164,6 +176,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
     let mut processing = false;
     let mut active: Option<ActiveJob> = None;
     let mut preview_cancel: Option<Arc<AtomicBool>> = None;
+    let mut estimate_cancel: Option<Arc<AtomicBool>> = None;
     loop {
         if let Some((id, cancelled, result_rx)) = &active {
             if let Ok((finished_id, result)) = result_rx.try_recv() {
@@ -202,6 +215,10 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
         };
         match command {
             Command::Probe(path) => {
+                // Opening another file makes any running size estimate pointless.
+                if let Some(cancelled) = estimate_cancel.take() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
                 let _ = events.send(Event::ProbeStarted);
                 let result = engine.probe(&path).map_err(|error| error.to_string());
                 let _ = events.send(Event::ProbeFinished(result));
@@ -244,6 +261,27 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                         .detect_crop(&path, duration_secs, width, height)
                         .map_err(|error| error.to_string());
                     let _ = crop_events.send(Event::CropDetected(result));
+                });
+            }
+            Command::EstimateSize { id, request } => {
+                if let Some(cancelled) = estimate_cancel.take() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                let cancelled = Arc::new(AtomicBool::new(false));
+                estimate_cancel = Some(cancelled.clone());
+                let estimate_engine = engine.clone();
+                let estimate_events = events.clone();
+                thread::spawn(move || {
+                    let mut emit = |event| {
+                        if let EngineEvent::Progress { fraction, .. } = event {
+                            let _ =
+                                estimate_events.send(Event::SizeEstimateProgress { id, fraction });
+                        }
+                    };
+                    let result = estimate_engine
+                        .estimate_size(&request, cancelled, &mut emit)
+                        .map_err(|error| error.to_string());
+                    let _ = estimate_events.send(Event::SizeEstimateFinished { id, result });
                 });
             }
             Command::BatchFiles { paths, settings } => {
@@ -290,6 +328,9 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
             }
             Command::Shutdown => {
                 if let Some(cancelled) = &preview_cancel {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                if let Some(cancelled) = &estimate_cancel {
                     cancelled.store(true, Ordering::Relaxed);
                 }
                 if let Some((_, cancelled, _)) = &active {

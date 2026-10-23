@@ -9,12 +9,14 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     AudioTrackSettings, CropMargins, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
+    SizeDerivation, SizeMeasurement,
     engine::ffmpeg::FfmpegEngine,
     model::{
         AudioEncoder, Container, EncoderSpeed, EngineCapabilities, MediaInfo, Preset, VideoEncoder,
     },
     persistence::Session,
     queue::{Command, Coordinator, Event, JobId, JobSnapshot, JobState},
+    size_derivation,
 };
 
 mod crop_editor;
@@ -47,6 +49,13 @@ enum Tab {
 enum Status {
     Info(String),
     Error(String),
+}
+
+/// State of the pre-encode size estimate for the current settings.
+enum SizeEstimateState {
+    Sampling { id: u64, fraction: f32 },
+    Measured,
+    Failed(String),
 }
 
 /// A job waiting on the "replace existing file?" confirmation.
@@ -84,6 +93,10 @@ pub struct App {
     preview_fast_seek: bool,
     next_preview_id: u64,
     active_preview_id: Option<u64>,
+    size_estimate: Option<SizeEstimateState>,
+    size_measurement: Option<SizeMeasurement>,
+    size_measurement_request: Option<EncodeRequest>,
+    next_estimate_id: u64,
     selected_audio_tracks: BTreeSet<u32>,
     pending_add: Option<PendingAdd>,
     status: Option<Status>,
@@ -156,6 +169,10 @@ impl App {
             preview_fast_seek: false,
             next_preview_id: 1,
             active_preview_id: None,
+            size_estimate: None,
+            size_measurement: None,
+            size_measurement_request: None,
+            next_estimate_id: 1,
             selected_audio_tracks: BTreeSet::new(),
             pending_add: None,
             status,
@@ -186,6 +203,9 @@ impl App {
                     self.preview_texture = None;
                     self.preview_error = None;
                     self.preview_due = None;
+                    self.size_estimate = None;
+                    self.size_measurement = None;
+                    self.size_measurement_request = None;
                 }
                 Event::ProbeFinished(result) => {
                     self.probing = false;
@@ -275,6 +295,32 @@ impl App {
                     }
                     Err(error) => self.capability_error = Some(error),
                 },
+                Event::SizeEstimateProgress { id, fraction } => {
+                    if let Some(SizeEstimateState::Sampling {
+                        id: active,
+                        fraction: shown,
+                    }) = &mut self.size_estimate
+                        && *active == id
+                    {
+                        *shown = fraction;
+                    }
+                }
+                Event::SizeEstimateFinished { id, result } => {
+                    if matches!(
+                        &self.size_estimate,
+                        Some(SizeEstimateState::Sampling { id: active, .. }) if *active == id
+                    ) {
+                        match result {
+                            Ok(measurement) => {
+                                self.size_measurement = Some(measurement);
+                                self.size_estimate = Some(SizeEstimateState::Measured);
+                            }
+                            Err(message) => {
+                                self.size_estimate = Some(SizeEstimateState::Failed(message));
+                            }
+                        }
+                    }
+                }
                 Event::BatchProgress { current, total } => {
                     self.status = Some(Status::Info(format!("Reading {current} of {total}…")));
                 }
@@ -1285,6 +1331,8 @@ impl App {
                     Tab::Audio => self.audio_ui(ui),
                     Tab::Picture => self.picture_ui(ui),
                 }
+                ui.add_space(14.0);
+                self.size_estimate_ui(ui);
             });
     }
 
@@ -1813,6 +1861,114 @@ impl App {
         crop.bottom &= !1;
         crop.left &= !1;
         crop.right &= !1;
+    }
+
+    /// A row under the settings tabs showing the projected output size. A measurement
+    /// survives quality, range, and audio edits — those derive instantly — while any
+    /// other change to the encode invalidates it.
+    fn size_estimate_ui(&mut self, ui: &mut egui::Ui) {
+        let current = self.build_request();
+        let derivation = match (&self.size_measurement_request, &current) {
+            (Some(previous), Some(next)) => Some(size_derivation(previous, next)),
+            (Some(_), None) => Some(SizeDerivation::Invalid),
+            (None, _) => None,
+        };
+        if derivation == Some(SizeDerivation::Invalid) {
+            self.size_estimate = None;
+            self.size_measurement = None;
+            self.size_measurement_request = None;
+        }
+        let Some(request) = current else {
+            return;
+        };
+        let view = match &self.size_estimate {
+            Some(SizeEstimateState::Sampling { fraction, .. }) => Some((
+                RichText::new(format!("Sampling… {:.0}%", fraction * 100.0)).color(theme::MUTED),
+                None,
+            )),
+            Some(SizeEstimateState::Measured) => {
+                let measurement = self
+                    .size_measurement
+                    .as_ref()
+                    .expect("a measured estimate always has its measurement");
+                let total = measurement.estimate_for(&request).total_bytes();
+                let (text, tooltip) = if derivation == Some(SizeDerivation::Same) {
+                    (
+                        format!("≈ {}", bytes(total)),
+                        "Measured with short sample encodes at these settings; the real size still varies with the content.".to_owned(),
+                    )
+                } else {
+                    (
+                        format!("≈ {}*", bytes(total)),
+                        format!(
+                            "Derived from the measurement at Q{}; press Estimate to re-measure.",
+                            measurement.quality
+                        ),
+                    )
+                };
+                Some((
+                    RichText::new(text).strong().color(Color32::WHITE),
+                    Some(tooltip),
+                ))
+            }
+            Some(SizeEstimateState::Failed(message)) => Some((
+                RichText::new("Estimate unavailable")
+                    .small()
+                    .color(theme::RED),
+                Some(message.clone()),
+            )),
+            None => None,
+        };
+        let sampling = matches!(self.size_estimate, Some(SizeEstimateState::Sampling { .. }));
+        let encoding = self.jobs.iter().any(|job| job.state == JobState::Running);
+        let range_too_short = self.trim_end_secs - self.trim_start_secs < 0.1;
+        let blocker = self.batch_blocker();
+        let enabled = !sampling && !encoding && !range_too_short && blocker.is_none();
+        let disabled_reason = if sampling {
+            "Sampling the video…"
+        } else if encoding {
+            "Wait for the running encode to finish."
+        } else if range_too_short {
+            "The selected range is too short."
+        } else {
+            blocker.unwrap_or_default()
+        };
+        let mut start = false;
+        field_row(ui, "Estimated size", |ui| {
+            ui.horizontal(|ui| {
+                if sampling {
+                    ui.spinner();
+                }
+                if let Some((text, tooltip)) = &view {
+                    let label = ui.label(text.clone());
+                    if let Some(tooltip) = tooltip {
+                        label.on_hover_text(tooltip);
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Estimate"))
+                        .on_hover_text("Encode short samples of this video to project its size")
+                        .on_disabled_hover_text(disabled_reason)
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                });
+            });
+        });
+        if start {
+            self.begin_size_estimate(request);
+        }
+    }
+
+    fn begin_size_estimate(&mut self, request: EncodeRequest) {
+        let id = self.next_estimate_id;
+        self.next_estimate_id += 1;
+        self.size_estimate = Some(SizeEstimateState::Sampling { id, fraction: 0.0 });
+        self.size_measurement = None;
+        self.size_measurement_request = Some(request.clone());
+        self.coordinator.send(Command::EstimateSize { id, request });
     }
 
     fn action_bar_ui(&mut self, ui: &mut egui::Ui) {
