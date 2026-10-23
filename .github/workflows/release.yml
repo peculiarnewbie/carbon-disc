@@ -80,6 +80,7 @@ jobs:
           cat ffmpeg-version.txt
           cd ..
           ext="tar.gz"
+          mv bundle "carbon-disc-v${version}-${{ matrix.platform }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             ext="zip"
             7z a "carbon-disc-v${version}-${{ matrix.platform }}.zip" "carbon-disc-v${version}-${{ matrix.platform }}"
