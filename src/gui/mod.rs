@@ -2250,6 +2250,10 @@ impl App {
                             sunken_frame(ui, |ui| {
                                 egui::ScrollArea::vertical()
                                     .id_salt("available_languages")
+                                    .auto_shrink([false, false])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                    )
                                     .max_height(106.0)
                                     .show(ui, |ui| {
                                         if available.is_empty() {
