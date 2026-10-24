@@ -57,5 +57,8 @@ pub fn apply(context: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 6.0);
     style.spacing.interact_size.y = 28.0;
+    // Popups (combo boxes, menus, tooltips) fade in over this duration; zero
+    // makes them appear instantly. egui handles 0.0 explicitly.
+    style.animation_time = 0.0;
     context.set_style_of(egui::Theme::Dark, style);
 }
