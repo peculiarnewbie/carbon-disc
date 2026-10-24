@@ -91,7 +91,10 @@ export default function App() {
         <button class="nav" onClick={() => step(-1)} aria-label="Previous screenshot">
           ‹
         </button>
-        <div class="frame">
+        <div
+          class="frame"
+          style={{ "--ar": String(shots[shot()].width / shots[shot()].height) }}
+        >
           <img
             src={shots[shot()].src}
             alt={shots[shot()].alt}

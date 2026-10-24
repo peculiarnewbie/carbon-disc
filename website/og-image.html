@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- og:image source. Regenerate website/public/og.png with:
+     pnpm exec vite preview  # or any static server on this directory
+     then screenshot this page at exactly 1200x630 and save the bytes. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      html,
+      body {
+        margin: 0;
+      }
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background:
+          radial-gradient(46rem 19rem at 50% -5rem, rgb(139 92 246 / 0.26), transparent),
+          #1a1d26;
+        font-family: "Adwaita Sans", "Red Hat Text", "Noto Sans", sans-serif;
+        color: #f8fafc;
+        -webkit-font-smoothing: antialiased;
+      }
+      .logo {
+        width: 156px;
+        height: 156px;
+      }
+      h1 {
+        margin: 50px 0 0;
+        font-size: 76px;
+        font-weight: 750;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+      }
+      p {
+        margin: 22px 0 0;
+        font-size: 33px;
+        font-weight: 450;
+        color: #94a3b8;
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="-10 -10 120 120">
+      <defs>
+        <mask id="d">
+          <rect x="-10" y="-10" width="120" height="120" fill="#fff" />
+          <circle cx="50" cy="50" r="15" fill="#000" />
+          <circle cx="32.37" cy="74.27" r="5.5" fill="#000" />
+          <circle cx="78.53" cy="40.73" r="5.5" fill="#000" />
+          <circle cx="67.63" cy="74.27" r="5.5" fill="#000" />
+          <path
+            d="M 6.15 39.88 A 45 45 0 0 1 53.92 5.17"
+            stroke="#000"
+            stroke-width="35"
+            fill="none"
+            stroke-linecap="round"
+          />
+        </mask>
+      </defs>
+      <circle cx="50" cy="50" r="46" fill="#8b5cf6" mask="url(#d)" />
+      <path
+        d="M 6.15 39.88 A 45 45 0 0 1 53.92 5.17"
+        stroke="#a78bfa"
+        stroke-width="30"
+        fill="none"
+        stroke-linecap="round"
+      />
+    </svg>
+    <h1>Yet another FFmpeg wrapper</h1>
+    <p>Open source, built with Rust and egui</p>
+  </body>
+</html>

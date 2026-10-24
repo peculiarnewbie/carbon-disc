@@ -130,13 +130,18 @@ a {
   justify-content: center;
   gap: 10px;
   min-height: 0;
+  container-type: size;
 }
 
 .frame {
   position: relative;
-  height: 100%;
-  max-width: min(100%, 860px);
-  aspect-ratio: 1552 / 1121;
+  /* The height term keeps the frame inside the shot area; multiplying by
+     the ratio converts it to the widest the image can be without leaving
+     letterbox bars inside the border. */
+  --ar: 1.375;
+  width: min(100%, 860px);
+  width: min(100cqw, 860px, calc(100cqh * var(--ar)));
+  aspect-ratio: var(--ar);
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 22px 60px rgb(0 0 0 / 0.45);
