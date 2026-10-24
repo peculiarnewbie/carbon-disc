@@ -98,6 +98,8 @@ pub struct App {
     selected_custom_preset: Option<String>,
     custom_presets: Vec<CustomPreset>,
     output: String,
+    /// Just the file name portion of `output`, edited in the sidebar field.
+    output_name: String,
     output_dir: Option<PathBuf>,
     trim_start_secs: f64,
     trim_end_secs: f64,
@@ -184,6 +186,7 @@ impl App {
             selected_custom_preset,
             custom_presets,
             output: String::new(),
+            output_name: String::new(),
             output_dir: session.output_dir,
             trim_start_secs: 0.0,
             trim_end_secs: 0.0,
@@ -262,10 +265,11 @@ impl App {
                             self.preview_due = Some(Instant::now());
                             self.settings.crop = CropMargins::ZERO;
                             self.detecting_crop = false;
-                            self.output = self
-                                .suggested_output(&media.path, None)
-                                .display()
-                                .to_string();
+                            self.set_output_path(
+                                self.suggested_output(&media.path, None)
+                                    .display()
+                                    .to_string(),
+                            );
                             self.media = Some(media);
                             self.estimate_due = Some(Instant::now() + ESTIMATE_DEBOUNCE);
                         }
@@ -444,7 +448,7 @@ impl App {
             Some("Open a video first.")
         } else if let Some(reason) = self.batch_blocker() {
             Some(reason)
-        } else if self.output.trim().is_empty() {
+        } else if self.output.trim().is_empty() || self.output_name.trim().is_empty() {
             Some("Choose where to save the encode.")
         } else if self.trim_end_secs - self.trim_start_secs < 0.1 {
             Some("The selected range is too short.")
@@ -1577,72 +1581,6 @@ impl App {
         if brush_response.drag_stopped() {
             self.schedule_preview(false);
         }
-
-        let mut seek_to = None;
-        let mut set_start = false;
-        let mut set_end = false;
-        let mut reset = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Start").color(theme::MUTED));
-            if ui
-                .add(timecode_drag(
-                    &mut self.trim_start_secs,
-                    0.0..=(self.trim_end_secs - 0.1).max(0.0),
-                ))
-                .on_hover_text("Drag or type a time like 1:30.5")
-                .changed()
-            {
-                seek_to = Some(self.trim_start_secs);
-            }
-            set_start = widgets::icon_button(ui, Icon::MarkIn, true)
-                .on_hover_text("Start the clip at the current frame (I)")
-                .clicked();
-            ui.add_space(14.0);
-            ui.label(RichText::new("End").color(theme::MUTED));
-            if ui
-                .add(timecode_drag(
-                    &mut self.trim_end_secs,
-                    (self.trim_start_secs + 0.1)..=source_duration,
-                ))
-                .on_hover_text("Drag or type a time like 1:30.5")
-                .changed()
-            {
-                seek_to = Some(self.trim_end_secs);
-            }
-            set_end = widgets::icon_button(ui, Icon::MarkOut, true)
-                .on_hover_text("End the clip at the current frame (O)")
-                .clicked();
-            ui.add_space(14.0);
-            let trimmed = self.trim_start_secs > 0.0 || self.trim_end_secs < source_duration - 0.05;
-            ui.label(RichText::new("Length").color(theme::MUTED));
-            ui.label(
-                RichText::new(format_timecode(
-                    self.trim_end_secs - self.trim_start_secs,
-                    false,
-                ))
-                .color(if trimmed {
-                    theme::VIOLET_LIGHT
-                } else {
-                    Color32::WHITE
-                }),
-            );
-            reset = widgets::icon_button(ui, Icon::FullRange, trimmed)
-                .on_hover_text("Use the whole video")
-                .clicked();
-        });
-        if set_start {
-            self.set_start_at_playhead();
-        }
-        if set_end {
-            self.set_end_at_playhead();
-        }
-        if reset {
-            self.trim_start_secs = 0.0;
-            self.trim_end_secs = source_duration;
-        }
-        if let Some(at_secs) = seek_to {
-            self.seek_preview(at_secs);
-        }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -1691,13 +1629,17 @@ impl App {
     }
 
     fn preset_bar_ui(&mut self, ui: &mut egui::Ui) {
-        let chip = self.estimate_chip();
         let modified = self.preset_modified();
         let mut chosen: Option<(Preset, Option<String>, EncodeSettings)> = None;
         let mut revert = false;
         let mut delete = false;
         let mut import = false;
         let mut export = false;
+        let source_duration = self.media.as_ref().map_or(0.0, |media| media.duration_secs);
+        let mut seek_to = None;
+        let mut set_start = false;
+        let mut set_end = false;
+        let mut reset = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Preset").strong().size(15.0));
             let label = if modified {
@@ -1895,20 +1837,74 @@ impl App {
                     export = true;
                 }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if chip.spinner {
-                    ui.spinner();
-                }
-                if let Some(label) = &chip.label {
-                    let response = ui.label(label.clone());
-                    if let Some(tooltip) = &chip.tooltip {
-                        response.on_hover_text(tooltip);
+            if self.media.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // The range group sits at the far right of the preset row.
+                    // Right-to-left layout renders in reverse, so the widgets
+                    // are added End-to-Start to read Start → End → Length.
+                    let trimmed =
+                        self.trim_start_secs > 0.0 || self.trim_end_secs < source_duration - 0.05;
+                    reset = widgets::icon_button(ui, Icon::FullRange, trimmed)
+                        .on_hover_text("Use the whole video")
+                        .clicked();
+                    ui.label(
+                        RichText::new(format_timecode(
+                            self.trim_end_secs - self.trim_start_secs,
+                            false,
+                        ))
+                        .color(if trimmed {
+                            theme::VIOLET_LIGHT
+                        } else {
+                            Color32::WHITE
+                        }),
+                    );
+                    ui.label(RichText::new("Length").color(theme::MUTED));
+                    ui.add_space(14.0);
+                    set_end = widgets::icon_button(ui, Icon::MarkOut, true)
+                        .on_hover_text("End the clip at the current frame (O)")
+                        .clicked();
+                    if ui
+                        .add(timecode_drag(
+                            &mut self.trim_end_secs,
+                            (self.trim_start_secs + 0.1)..=source_duration,
+                        ))
+                        .on_hover_text("Drag or type a time like 1:30.5")
+                        .changed()
+                    {
+                        seek_to = Some(self.trim_end_secs);
                     }
-                } else {
-                    ui.label(RichText::new("Estimated size…").color(theme::MUTED));
-                }
-            });
+                    ui.label(RichText::new("End").color(theme::MUTED));
+                    ui.add_space(14.0);
+                    set_start = widgets::icon_button(ui, Icon::MarkIn, true)
+                        .on_hover_text("Start the clip at the current frame (I)")
+                        .clicked();
+                    if ui
+                        .add(timecode_drag(
+                            &mut self.trim_start_secs,
+                            0.0..=(self.trim_end_secs - 0.1).max(0.0),
+                        ))
+                        .on_hover_text("Drag or type a time like 1:30.5")
+                        .changed()
+                    {
+                        seek_to = Some(self.trim_start_secs);
+                    }
+                    ui.label(RichText::new("Start").color(theme::MUTED));
+                });
+            }
         });
+        if set_start {
+            self.set_start_at_playhead();
+        }
+        if set_end {
+            self.set_end_at_playhead();
+        }
+        if reset {
+            self.trim_start_secs = 0.0;
+            self.trim_end_secs = source_duration;
+        }
+        if let Some(at_secs) = seek_to {
+            self.seek_preview(at_secs);
+        }
         let description = if let Some(name) = &self.selected_custom_preset {
             self.custom_presets
                 .iter()
