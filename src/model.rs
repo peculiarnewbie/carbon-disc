@@ -85,6 +85,7 @@ pub fn size_derivation(measured: &EncodeRequest, next: &EncodeRequest) -> SizeDe
         || measured.source_duration_secs != next.source_duration_secs
         || was.video_encoder != now.video_encoder
         || was.speed != now.speed
+        || was.frame_rate != now.frame_rate
         || was.container != now.container
         || was.max_width != now.max_width
         || was.max_height != now.max_height
@@ -146,9 +147,30 @@ pub struct MediaStream {
     pub codec: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// The stream's frame rate as a `numerator/denominator` pair, e.g. `(30_000, 1_001)`.
+    pub frame_rate: Option<(u32, u32)>,
     pub channels: Option<u32>,
     pub language: Option<String>,
     pub title: Option<String>,
+}
+
+impl MediaStream {
+    /// The frame rate as a decimal string with trailing zeros trimmed, e.g.
+    /// `29.97` for 30000/1001 and `25` for 25/1.
+    #[must_use]
+    pub fn frame_rate_display(&self) -> Option<String> {
+        let (num, den) = self.frame_rate?;
+        let fps = f64::from(num) / f64::from(den);
+        let mut text = format!("{fps:.3}");
+        if text.ends_with("000") {
+            text.truncate(text.len() - 4);
+        } else if text.ends_with("00") {
+            text.truncate(text.len() - 3);
+        } else if text.ends_with('0') {
+            text.truncate(text.len() - 1);
+        }
+        Some(text)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,6 +239,11 @@ impl EncodeRequest {
         if self.settings.max_width == Some(0) || self.settings.max_height == Some(0) {
             return Err(crate::Error::InvalidRequest(
                 "output dimensions must be greater than zero".into(),
+            ));
+        }
+        if self.settings.frame_rate == Some(0) {
+            return Err(crate::Error::InvalidRequest(
+                "frame rate must be greater than zero".into(),
             ));
         }
         let mut indices = std::collections::HashSet::new();
@@ -333,6 +360,9 @@ pub struct EncodeSettings {
     pub video_encoder: VideoEncoder,
     pub quality: u8,
     pub speed: EncoderSpeed,
+    /// Output frame rate in frames per second. `None` keeps the source's rate
+    /// and timestamps; a target makes FFmpeg duplicate or drop frames (CFR).
+    pub frame_rate: Option<u32>,
     pub audio_encoder: AudioEncoder,
     pub audio_bitrate_kbps: u16,
     pub max_width: Option<u32>,
@@ -623,6 +653,7 @@ impl Preset {
                 video_encoder: VideoEncoder::H264,
                 quality: 24,
                 speed: EncoderSpeed::Fast,
+                frame_rate: None,
                 audio_encoder: AudioEncoder::Aac,
                 audio_bitrate_kbps: 160,
                 max_width: Some(1920),
@@ -634,6 +665,7 @@ impl Preset {
                 video_encoder: VideoEncoder::H264,
                 quality: 21,
                 speed: EncoderSpeed::Balanced,
+                frame_rate: None,
                 audio_encoder: AudioEncoder::Aac,
                 audio_bitrate_kbps: 192,
                 max_width: None,
@@ -645,6 +677,7 @@ impl Preset {
                 video_encoder: VideoEncoder::H265,
                 quality: 18,
                 speed: EncoderSpeed::Quality,
+                frame_rate: None,
                 audio_encoder: AudioEncoder::Opus,
                 audio_bitrate_kbps: 192,
                 max_width: None,
@@ -656,6 +689,7 @@ impl Preset {
                 video_encoder: VideoEncoder::Av1,
                 quality: 30,
                 speed: EncoderSpeed::Quality,
+                frame_rate: None,
                 audio_encoder: AudioEncoder::Opus,
                 audio_bitrate_kbps: 128,
                 max_width: None,
@@ -757,6 +791,48 @@ mod tests {
             size_derivation(&measured, &passthrough),
             SizeDerivation::Invalid
         );
+    }
+
+    #[test]
+    fn changing_the_frame_rate_needs_a_new_measurement() {
+        let measured = estimate_fixture("source.mkv", 21);
+        let mut retimed = estimate_fixture("source.mkv", 21);
+        retimed.settings.frame_rate = Some(30);
+        assert_eq!(
+            size_derivation(&measured, &retimed),
+            SizeDerivation::Invalid
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_frame_rate() {
+        let mut request = estimate_fixture("source.mkv", 21);
+        request.settings.frame_rate = Some(0);
+        assert!(request.validate().is_err());
+        request.settings.frame_rate = Some(24);
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn frame_rate_display_trims_to_conventional_precision() {
+        let mut stream = MediaStream {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: None,
+            height: None,
+            frame_rate: Some((30_000, 1_001)),
+            channels: None,
+            language: None,
+            title: None,
+        };
+        assert_eq!(stream.frame_rate_display().as_deref(), Some("29.97"));
+        stream.frame_rate = Some((24_000, 1_001));
+        assert_eq!(stream.frame_rate_display().as_deref(), Some("23.976"));
+        stream.frame_rate = Some((25, 1));
+        assert_eq!(stream.frame_rate_display().as_deref(), Some("25"));
+        stream.frame_rate = None;
+        assert_eq!(stream.frame_rate_display(), None);
     }
 
     #[test]

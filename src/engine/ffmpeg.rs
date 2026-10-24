@@ -214,6 +214,9 @@ impl FfmpegEngine {
                 args.extend([OsString::from("-q:v"), settings.quality.to_string().into()]);
             }
         }
+        if let Some(frame_rate) = settings.frame_rate {
+            args.extend([OsString::from("-r"), frame_rate.to_string().into()]);
+        }
         for (output_index, track) in request.audio_tracks.iter().enumerate() {
             let codec_option = format!("-c:a:{output_index}");
             match track.encoder {
@@ -1063,9 +1066,19 @@ struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
     sample_aspect_ratio: Option<String>,
+    avg_frame_rate: Option<String>,
+    r_frame_rate: Option<String>,
     side_data_list: Option<Vec<ProbeSideData>>,
     channels: Option<u32>,
     tags: Option<HashMap<String, String>>,
+}
+
+/// Parses ffprobe's `num/den` rate strings into a `(numerator, denominator)` pair.
+fn parse_rate(rate: Option<&String>) -> Option<(u32, u32)> {
+    let (num, den) = rate?.split_once('/')?;
+    let num = num.trim().parse().ok()?;
+    let den = den.trim().parse().ok()?;
+    (num > 0 && den > 0).then_some((num, den))
 }
 
 #[derive(Deserialize)]
@@ -1114,6 +1127,8 @@ fn parse_probe(path: &Path, bytes: &[u8]) -> Result<MediaInfo> {
                     codec: stream.codec_name.unwrap_or_else(|| "unknown".into()),
                     width,
                     height,
+                    frame_rate: parse_rate(stream.avg_frame_rate.as_ref())
+                        .or_else(|| parse_rate(stream.r_frame_rate.as_ref())),
                     channels: stream.channels,
                     language: tag(&stream.tags, "language"),
                     title: tag(&stream.tags, "title"),
@@ -1297,15 +1312,31 @@ mod tests {
 
     #[test]
     fn parses_probe_json() {
-        let info = parse_probe(Path::new("movie.mkv"), br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080},{"index":1,"codec_type":"audio","codec_name":"aac","channels":2,"tags":{"language":"eng"}}],"format":{"format_name":"matroska","duration":"12.5","size":"1000","bit_rate":"640"}}"#).expect("valid fixture");
+        let info = parse_probe(Path::new("movie.mkv"), br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30000/1001"},{"index":1,"codec_type":"audio","codec_name":"aac","channels":2,"tags":{"language":"eng"}}],"format":{"format_name":"matroska","duration":"12.5","size":"1000","bit_rate":"640"}}"#).expect("valid fixture");
         assert_eq!(info.duration_secs, 12.5);
         assert_eq!(info.video_stream().and_then(|s| s.width), Some(1920));
+        assert_eq!(
+            info.video_stream().and_then(|s| s.frame_rate),
+            Some((30_000, 1_001))
+        );
         assert_eq!(
             info.audio_streams()
                 .next()
                 .and_then(|s| s.language.as_deref()),
             Some("eng")
         );
+    }
+
+    #[test]
+    fn probe_frame_rate_falls_back_from_average_to_real() {
+        let info = parse_probe(Path::new("clip.mp4"), br#"{"streams":[{"index":0,"codec_type":"video","avg_frame_rate":"0/0","r_frame_rate":"25/1"}],"format":null}"#).expect("valid fixture");
+        assert_eq!(
+            info.video_stream().and_then(|s| s.frame_rate),
+            Some((25, 1))
+        );
+        // Zero rates are not real frame rates and stay absent.
+        let broken = parse_probe(Path::new("clip.mp4"), br#"{"streams":[{"index":0,"codec_type":"video","avg_frame_rate":"0/0","r_frame_rate":"0/30"}],"format":null}"#).expect("valid fixture");
+        assert_eq!(broken.video_stream().and_then(|s| s.frame_rate), None);
     }
 
     #[test]
@@ -1362,6 +1393,36 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "hevc_nvenc"]));
         assert!(args.windows(2).any(|pair| pair == ["-cq", "21"]));
         assert!(!args.iter().any(|arg| arg == "-crf"));
+    }
+
+    #[test]
+    fn frame_rate_target_becomes_an_output_rate_argument() {
+        let settings = EncodeSettings {
+            frame_rate: Some(24),
+            ..EncodeSettings::default()
+        };
+        let request = EncodeRequest {
+            input: "in.mkv".into(),
+            output: "out.mp4".into(),
+            source_duration_secs: 10.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: crate::EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            overwrite: false,
+            settings,
+        };
+        let args = FfmpegEngine::encode_args(&request);
+        assert!(args.windows(2).any(|pair| pair == ["-r", "24"]));
+
+        // The default keeps the source's rate and emits nothing.
+        let mut request = request;
+        request.settings.frame_rate = None;
+        assert!(
+            !FfmpegEngine::encode_args(&request)
+                .iter()
+                .any(|arg| arg == "-r")
+        );
     }
 
     #[test]

@@ -37,6 +37,7 @@ const RESOLUTION_LIMITS: [(&str, u32, u32); 5] = [
     ("480p", 854, 480),
 ];
 const AUDIO_BITRATES: [u16; 9] = [64, 96, 128, 160, 192, 256, 320, 384, 512];
+const FRAME_RATE_CHOICES: [u32; 6] = [24, 25, 30, 48, 50, 60];
 const ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(1500);
 const PRIMARY_BUTTON_SIZE: egui::Vec2 = egui::vec2(150.0, 34.0);
 
@@ -1332,6 +1333,9 @@ impl App {
                 video.height.unwrap_or(0),
                 video.codec.to_uppercase()
             ));
+            if let Some(fps) = video.frame_rate_display() {
+                facts.push(format!("{fps} fps"));
+            }
         }
         let audio_count = media.audio_streams().count();
         facts.push(format!(
@@ -1875,6 +1879,41 @@ impl App {
                 .collect();
             widgets::segmented(ui, "speed", &mut self.settings.speed, &options, |_| None);
             hint(ui, "Slower encodes make smaller files at the same quality");
+        });
+        field_row(ui, "Frame rate", |ui| {
+            let selected = self
+                .settings
+                .frame_rate
+                .map_or_else(|| "Same as source".to_owned(), |fps| format!("{fps} fps"));
+            egui::ComboBox::from_id_salt("frame_rate")
+                .selected_text(selected)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.frame_rate, None, "Same as source");
+                    for fps in FRAME_RATE_CHOICES {
+                        ui.selectable_value(
+                            &mut self.settings.frame_rate,
+                            Some(fps),
+                            format!("{fps} fps"),
+                        );
+                    }
+                });
+            let source_rate = self
+                .media
+                .as_ref()
+                .and_then(|media| media.video_stream())
+                .and_then(|video| video.frame_rate_display());
+            let hint_text = match (&self.settings.frame_rate, source_rate) {
+                (Some(_), Some(source)) => {
+                    format!("Re-times frames to hit the target; the source runs at {source} fps")
+                }
+                (Some(_), None) => {
+                    "Re-times frames to hit the target; lower rates make smaller files".to_owned()
+                }
+                (None, Some(source)) => format!("Encodes at the source's {source} fps"),
+                (None, None) => "Keeps the source's frame rate".to_owned(),
+            };
+            hint(ui, &hint_text);
         });
         field_row(ui, "Format", |ui| {
             let options: Vec<_> = Container::ALL
@@ -2849,6 +2888,9 @@ fn settings_summary(settings: &EncodeSettings) -> String {
                     |(name, _, _)| format!("≤{name}"),
                 ),
         );
+    }
+    if let Some(fps) = settings.frame_rate {
+        parts.push(format!("{fps} fps"));
     }
     parts.push(match settings.audio_encoder {
         AudioEncoder::Copy => "audio passthrough".to_owned(),
