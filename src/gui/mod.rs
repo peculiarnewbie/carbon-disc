@@ -639,10 +639,8 @@ impl App {
             && let Some(media) = &self.media
             && Path::new(self.output.trim()) == output
         {
-            self.output = self
-                .suggested_output(&media.path, Some(&output))
-                .display()
-                .to_string();
+            let suggested = self.suggested_output(&media.path, Some(&output));
+            self.set_output_path(suggested.display().to_string());
         }
     }
 
@@ -684,12 +682,20 @@ impl App {
         candidate
     }
 
+    /// Sets the output path, keeping the sidebar's name-only field in sync.
+    fn set_output_path(&mut self, path: String) {
+        self.output = path;
+        self.output_name = file_name(Path::new(self.output.trim()));
+    }
+
     fn sync_output_extension(&mut self) {
         if !self.output.trim().is_empty() {
-            self.output = PathBuf::from(self.output.trim())
-                .with_extension(self.settings.container.extension())
-                .display()
-                .to_string();
+            self.set_output_path(
+                PathBuf::from(self.output.trim())
+                    .with_extension(self.settings.container.extension())
+                    .display()
+                    .to_string(),
+            );
         }
     }
 
@@ -948,14 +954,6 @@ impl eframe::App for App {
             .min_size(260.0)
             .frame(panel_frame())
             .show(root, |ui| self.queue_ui(ui));
-        egui::Panel::bottom("actions")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(18, 12))
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
-            )
-            .show(root, |ui| self.action_bar_ui(ui));
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -2705,14 +2703,50 @@ impl App {
     }
 
     fn action_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let chip = self.estimate_chip();
         if self.media.is_some() {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Save as").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chip.spinner {
+                        ui.spinner();
+                    }
+                    if let Some(label) = &chip.label {
+                        let response = ui.label(label.clone());
+                        if let Some(tooltip) = &chip.tooltip {
+                            response.on_hover_text(tooltip);
+                        }
+                    } else {
+                        ui.label(RichText::new("Estimated size…").color(theme::MUTED));
+                    }
+                });
+            });
+            // The field edits only the file name; the folder sits above it for
+            // context, since a full path would scroll its tail out of view.
+            let folder = Path::new(self.output.trim())
+                .parent()
+                .unwrap_or(Path::new(""))
+                .display()
+                .to_string();
+            if !folder.is_empty() {
+                ui.add(
+                    egui::Label::new(RichText::new(&folder).small().color(theme::MUTED)).truncate(),
+                )
+                .on_hover_text(&folder);
+            }
+            ui.horizontal(|ui| {
                 let browse_width = 90.0;
-                ui.add_sized(
+                let response = ui.add_sized(
                     [ui.available_width() - browse_width, 30.0],
-                    egui::TextEdit::singleline(&mut self.output).hint_text("Choose an output file"),
+                    egui::TextEdit::singleline(&mut self.output_name).hint_text("File name"),
                 );
+                if response.changed() {
+                    let parent = Path::new(self.output.trim())
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf();
+                    self.output = parent.join(self.output_name.trim()).display().to_string();
+                }
                 if ui.button("Browse…").clicked() {
                     let output = PathBuf::from(self.output.trim());
                     let mut dialog = rfd::FileDialog::new()
@@ -2726,10 +2760,11 @@ impl App {
                     }
                     if let Some(path) = dialog.save_file() {
                         self.output_dir = path.parent().map(Path::to_path_buf);
-                        self.output = path
-                            .with_extension(self.settings.container.extension())
-                            .display()
-                            .to_string();
+                        self.set_output_path(
+                            path.with_extension(self.settings.container.extension())
+                                .display()
+                                .to_string(),
+                        );
                     }
                 }
             });
@@ -2958,6 +2993,8 @@ impl App {
     }
 
     fn queue_ui(&mut self, ui: &mut egui::Ui) {
+        self.action_bar_ui(ui);
+        ui.separator();
         let running = self.jobs.iter().any(|job| job.state == JobState::Running);
         let waiting = self
             .jobs
