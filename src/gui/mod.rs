@@ -2169,28 +2169,32 @@ impl App {
                             });
                         },
                     );
-                    ui.allocate_ui(egui::vec2(74.0, 130.0), |ui| {
-                        ui.add_space(ui.spacing().interact_size.y + 6.0);
-                        ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
-                            if ui.button("Add").clicked()
-                                && let Some(code) = self.available_language_pick.take()
-                            {
-                                self.settings.subtitle_languages.push(code);
-                                self.selected_language_pick = None;
-                            }
-                        });
-                        ui.add_space(6.0);
-                        ui.add_enabled_ui(self.selected_language_pick.is_some(), |ui| {
-                            if ui.button("Remove").clicked()
-                                && let Some(code) = self.selected_language_pick.take()
-                            {
-                                self.settings
-                                    .subtitle_languages
-                                    .retain(|kept| kept != &code);
-                                self.available_language_pick = None;
-                            }
-                        });
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(74.0, 130.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.add_space(ui.spacing().interact_size.y + 6.0);
+                            ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
+                                if ui.button("Add").clicked()
+                                    && let Some(code) = self.available_language_pick.take()
+                                {
+                                    self.settings.subtitle_languages.push(code);
+                                    self.selected_language_pick = None;
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.add_enabled_ui(self.selected_language_pick.is_some(), |ui| {
+                                if ui.button("Remove").clicked()
+                                    && let Some(code) = self.selected_language_pick.take()
+                                {
+                                    self.settings
+                                        .subtitle_languages
+                                        .retain(|kept| kept != &code);
+                                    self.available_language_pick = None;
+                                }
+                            });
+                        },
+                    );
                     ui.allocate_ui_with_layout(
                         egui::vec2(170.0, 130.0),
                         egui::Layout::top_down(egui::Align::Min),
