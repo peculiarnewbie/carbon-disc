@@ -26,6 +26,9 @@ pub struct JobSnapshot {
     pub progress: f32,
     pub speed: Option<f32>,
     pub error: Option<String>,
+    /// Estimated output size carried over from the sidebar at add time, when a
+    /// size measurement applied to the request.
+    pub estimated_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +69,10 @@ pub enum Command {
         path: PathBuf,
         settings: EncodeSettings,
     },
-    Add(EncodeRequest),
+    Add {
+        request: EncodeRequest,
+        estimated_size: Option<u64>,
+    },
     Remove(JobId),
     Start,
     Cancel,
@@ -165,6 +171,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                     progress: 0.0,
                     speed: None,
                     error,
+                    estimated_size: None,
                 });
                 next_id += 1;
             }
@@ -304,7 +311,10 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                 import_paths(&engine, paths, &settings, &mut jobs, &mut next_id, &events);
                 persist_jobs(&jobs, &events);
             }
-            Command::Add(request) => {
+            Command::Add {
+                request,
+                estimated_size,
+            } => {
                 jobs.push_back(JobSnapshot {
                     id: next_id,
                     request,
@@ -312,6 +322,7 @@ fn run(engine: Arc<dyn MediaEngine>, commands: Receiver<Command>, events: Sender
                     progress: 0.0,
                     speed: None,
                     error: None,
+                    estimated_size,
                 });
                 next_id += 1;
                 let _ = events.send(Event::Snapshot(jobs.iter().cloned().collect()));
@@ -389,6 +400,7 @@ fn maybe_start(
     job.state = JobState::Running;
     let id = job.id;
     let request = job.request.clone();
+    let estimated_size = job.estimated_size;
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_worker = cancelled.clone();
     let engine = engine.clone();
@@ -408,6 +420,7 @@ fn maybe_start(
                     progress: fraction,
                     speed,
                     error: None,
+                    estimated_size,
                 }]));
             }
         };
@@ -472,6 +485,7 @@ fn import_paths(
                     progress: 0.0,
                     speed: None,
                     error,
+                    estimated_size: None,
                 });
                 *next_id += 1;
                 added += 1;

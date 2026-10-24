@@ -578,6 +578,17 @@ impl App {
         self.submit(request, start, None);
     }
 
+    /// The estimated output size for this request, when the current size
+    /// measurement still applies to it. Carried onto the queued job.
+    fn current_size_estimate(&self, request: &EncodeRequest) -> Option<u64> {
+        let measurement = self.size_measurement.as_ref()?;
+        let measured = self.size_measurement_request.as_ref()?;
+        if size_derivation(measured, request) == SizeDerivation::Invalid {
+            return None;
+        }
+        Some(measurement.estimate_for(request).total_bytes())
+    }
+
     /// Validates a request and either queues it or asks before replacing an existing file.
     fn submit(&mut self, request: EncodeRequest, start: bool, replaces: Option<JobId>) {
         if let Err(error) = request.validate() {
@@ -612,7 +623,11 @@ impl App {
         }
         let name = file_name(&request.output);
         let output = request.output.clone();
-        self.coordinator.send(Command::Add(request));
+        let estimated_size = self.current_size_estimate(&request);
+        self.coordinator.send(Command::Add {
+            request,
+            estimated_size,
+        });
         if start {
             self.coordinator.send(Command::Start);
             self.status = Some(Status::Info(format!("Encoding {name}")));
@@ -3105,6 +3120,9 @@ fn job_card(ui: &mut egui::Ui, job: &JobSnapshot, actions: &mut Vec<JobAction>) 
                         .end_secs
                         .map_or_else(|| "end".into(), |end| format_timecode(end, false)),
                 );
+            }
+            if let Some(estimated_size) = job.estimated_size {
+                details = format!("{details}  ·  ≈ {}", bytes(estimated_size));
             }
             ui.add(egui::Label::new(RichText::new(details).small().color(theme::MUTED)).truncate());
             ui.add_space(2.0);
