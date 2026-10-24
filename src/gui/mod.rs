@@ -2139,7 +2139,7 @@ impl App {
                 // Add/Remove buttons between them.
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(170.0, 130.0),
+                        egui::vec2(220.0, 130.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.label(RichText::new("Available").color(theme::MUTED));
@@ -2171,7 +2171,7 @@ impl App {
                     );
                     ui.allocate_ui_with_layout(
                         egui::vec2(74.0, 130.0),
-                        egui::Layout::top_down(egui::Align::Min),
+                        egui::Layout::top_down(egui::Align::Center),
                         |ui| {
                             ui.add_space(ui.spacing().interact_size.y + 6.0);
                             ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
@@ -2196,13 +2196,17 @@ impl App {
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        egui::vec2(170.0, 130.0),
+                        egui::vec2(220.0, 130.0),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.label(RichText::new("Selected").color(theme::MUTED));
                             sunken_frame(ui, |ui| {
                                 egui::ScrollArea::vertical()
                                     .id_salt("selected_languages")
+                                    .auto_shrink([false, false])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                    )
                                     .max_height(106.0)
                                     .show(ui, |ui| {
                                         if self.settings.subtitle_languages.is_empty() {
