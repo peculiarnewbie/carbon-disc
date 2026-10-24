@@ -32,31 +32,34 @@ jobs:
           target: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
 
-      # One build per OS feeds both archives: the slim one ships the bare app,
-      # the full one adds FFmpeg and licenses. The binaries are identical.
+      # One build per OS feeds both slim and full assets: the slim one ships
+      # the bare app, the full one adds FFmpeg and licenses. The binaries are
+      # identical. Unix slims stay tarballs (share/ tree on Linux, exec bit on
+      # macOS); the Windows slim is the bare exe, with README-slim.txt
+      # published as a separate release asset by the publish job.
       - name: Assemble slim bundle
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           name="carbon-disc-v${version}-slim-${{ matrix.platform }}"
-          mkdir -p bundle
-          cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
-          cp packaging/README-slim.txt bundle/README.txt
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            mkdir -p bundle/share/applications
-            cp packaging/carbon-disc.desktop bundle/share/applications/
-            for size in 16 32 48 64 128 256; do
-              mkdir -p "bundle/share/icons/hicolor/${size}x${size}/apps"
-              cp "assets/logo-${size}.png" "bundle/share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
-            done
-          fi
-          mv bundle "$name"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "${name}.zip" "$name"
+            cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "${name}${{ matrix.ext }}"
           else
+            mkdir -p bundle
+            cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
+            cp packaging/README-slim.txt bundle/README.txt
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              mkdir -p bundle/share/applications
+              cp packaging/carbon-disc.desktop bundle/share/applications/
+              for size in 16 32 48 64 128 256; do
+                mkdir -p "bundle/share/icons/hicolor/${size}x${size}/apps"
+                cp "assets/logo-${size}.png" "bundle/share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
+              done
+            fi
+            mv bundle "$name"
             tar -czf "${name}.tar.gz" "$name"
+            rm -rf "$name"
           fi
-          rm -rf "$name"
 
       - name: Fetch FFmpeg (Linux)
         if: runner.os == 'Linux'
@@ -123,11 +126,13 @@ jobs:
           path: |
             carbon-disc-v*.tar.gz
             carbon-disc-v*.zip
+            carbon-disc-v*.exe
 
   publish:
     needs: bundle
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release
@@ -149,4 +154,6 @@ jobs:
 
             Both are the same application — pick slim unless you want FFmpeg bundled.
           generate_release_notes: true
-          files: release/*
+          files: |
+            release/*
+            packaging/README-slim.txt
