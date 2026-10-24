@@ -1751,6 +1751,7 @@ impl App {
                                 .auto_shrink([false, false])
                                 .max_height(380.0)
                                 .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
                                     let query = self.preset_search.to_lowercase();
                                     let mut shown = 0;
                                     let mut last_category = "";
