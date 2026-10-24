@@ -1738,7 +1738,7 @@ impl App {
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
                         )
                         .ui(ui, |ui| {
-                            ui.set_min_width(580.0);
+                            ui.set_min_width(660.0);
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.preset_search)
                                     .hint_text("Search presets…")
@@ -1755,7 +1755,7 @@ impl App {
                                     // inside each button so the whole column
                                     // stays hoverable.
                                     ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+                                    ui.spacing_mut().button_padding = egui::vec2(10.0, 9.0);
                                     let query = self.preset_search.to_lowercase();
                                     let mut shown = 0;
                                     let mut last_category = "";
@@ -1783,6 +1783,12 @@ impl App {
                                         // followed by the settings summary in a
                                         // smaller, muted style.
                                         let mut row_text = egui::text::LayoutJob::default();
+                                        row_text.wrap = egui::text::TextWrapping {
+                                            max_width: 620.0,
+                                            max_rows: 1,
+                                            break_anywhere: false,
+                                            overflow_character: Some('…'),
+                                        };
                                         row_text.append(
                                             preset.name,
                                             0.0,
