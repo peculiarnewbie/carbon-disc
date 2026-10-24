@@ -47,11 +47,12 @@ rewriting the app.
 
 ## Install
 
-Prebuilt downloads for Linux, Windows, and macOS bundle FFmpeg, so nothing
-else is needed — grab one from the
-[releases](https://github.com/peculiarnewbie/carbon-disc/releases). The macOS
-build is x86_64 (it runs on Apple Silicon through Rosetta) and is not
-code-signed, so right-click → Open it the first time.
+Prebuilt downloads for Linux, Windows, and macOS are on the
+[releases](https://github.com/peculiarnewbie/carbon-disc/releases) page. The
+**slim** builds are small and do not include FFmpeg — the app shows per-platform
+install instructions on first launch — while the full builds bundle FFmpeg and
+need nothing else. The macOS build is x86_64 (it runs on Apple Silicon through
+Rosetta) and is not code-signed, so right-click → Open it the first time.
 
 ## Requirements
 
