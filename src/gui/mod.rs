@@ -1768,12 +1768,16 @@ impl App {
                                         }
                                         shown += 1;
                                         if preset.category != last_category {
-                                            ui.add_space(2.0);
+                                            if shown > 1 {
+                                                ui.add_space(8.0);
+                                                ui.separator();
+                                                ui.add_space(2.0);
+                                            }
                                             ui.label(
-                                                RichText::new(preset.category)
+                                                RichText::new(preset.category.to_uppercase())
                                                     .small()
                                                     .strong()
-                                                    .color(theme::MUTED),
+                                                    .color(theme::VIOLET_LIGHT),
                                             );
                                             last_category = preset.category;
                                         }
