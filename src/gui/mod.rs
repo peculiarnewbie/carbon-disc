@@ -131,9 +131,7 @@ pub struct App {
     preset_name_input: String,
     preset_description_input: String,
     more_preset: Option<String>,
-    more_presets_open: bool,
     preset_search: String,
-    preset_search_focus: bool,
     tab: Tab,
     confirm_close: bool,
     allow_close: bool,
@@ -221,9 +219,7 @@ impl App {
             more_preset: session
                 .more_preset
                 .filter(|name| handbrake::find(name).is_some()),
-            more_presets_open: false,
             preset_search: String::new(),
-            preset_search_focus: false,
             tab: Tab::Video,
             confirm_close: false,
             allow_close: false,
@@ -1734,15 +1730,81 @@ impl App {
                         }
                     }
                     ui.separator();
-                    if ui
-                        .selectable_label(false, "More…")
-                        .on_hover_text("HandBrake's official presets, searchable")
-                        .clicked()
-                    {
-                        self.more_presets_open = true;
-                        self.preset_search_focus = true;
-                        ui.close();
-                    }
+                    // Inside a combo popup this renders as a submenu with the
+                    // right arrow that opens on hover.
+                    let (more_response, _) = egui::containers::menu::SubMenuButton::new("More…")
+                        .config(
+                            egui::containers::menu::MenuConfig::new()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
+                            ui.set_min_width(580.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.preset_search)
+                                    .hint_text("Search presets…")
+                                    .desired_width(f32::INFINITY)
+                                    .min_size(egui::vec2(0.0, 32.0)),
+                            );
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("more_presets")
+                                .auto_shrink([false, false])
+                                .max_height(380.0)
+                                .show(ui, |ui| {
+                                    let query = self.preset_search.to_lowercase();
+                                    let mut shown = 0;
+                                    let mut last_category = "";
+                                    for preset in &handbrake::MORE_PRESETS {
+                                        if !query.is_empty()
+                                            && !preset.name.to_lowercase().contains(&query)
+                                            && !preset.category.to_lowercase().contains(&query)
+                                        {
+                                            continue;
+                                        }
+                                        shown += 1;
+                                        if preset.category != last_category {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                RichText::new(preset.category)
+                                                    .small()
+                                                    .strong()
+                                                    .color(theme::MUTED),
+                                            );
+                                            last_category = preset.category;
+                                        }
+                                        let selected =
+                                            self.more_preset.as_deref() == Some(preset.name);
+                                        let row = ui.horizontal(|ui| {
+                                            let name = ui.selectable_label(
+                                                selected,
+                                                RichText::new(preset.name).color(Color32::WHITE),
+                                            );
+                                            let detail = ui.label(
+                                                RichText::new(settings_summary(&preset.settings))
+                                                    .small()
+                                                    .color(theme::MUTED),
+                                            );
+                                            name.union(detail)
+                                        });
+                                        if row.inner.clicked() {
+                                            let settings = preset.settings.clone();
+                                            self.selected_custom_preset = None;
+                                            self.more_preset = Some(preset.name.to_owned());
+                                            self.apply_settings(settings);
+                                            self.preset_search.clear();
+                                            ui.close_kind(egui::UiKind::Menu);
+                                            ui.close_kind(egui::UiKind::Popup);
+                                        }
+                                    }
+                                    if shown == 0 {
+                                        ui.label(
+                                            RichText::new("No presets match your search.")
+                                                .color(theme::MUTED),
+                                        );
+                                    }
+                                });
+                        });
+                    more_response.on_hover_text("HandBrake's official presets, searchable");
                 });
             if modified {
                 revert = ui
@@ -1822,77 +1884,6 @@ impl App {
             })
             .color(theme::MUTED),
         );
-
-        if self.more_presets_open {
-            let mut open = self.more_presets_open;
-            egui::Window::new("More presets")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_width(430.0)
-                .show(ui.ctx(), |ui| {
-                    let search = egui::TextEdit::singleline(&mut self.preset_search)
-                        .hint_text("Search presets…")
-                        .desired_width(f32::INFINITY);
-                    let response = ui.add(search);
-                    if self.preset_search_focus {
-                        response.request_focus();
-                        self.preset_search_focus = false;
-                    }
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("more_presets")
-                        .auto_shrink([false, false])
-                        .max_height(340.0)
-                        .show(ui, |ui| {
-                            let query = self.preset_search.to_lowercase();
-                            let mut shown = 0;
-                            let mut last_category = "";
-                            for preset in &handbrake::MORE_PRESETS {
-                                if !query.is_empty()
-                                    && !preset.name.to_lowercase().contains(&query)
-                                    && !preset.category.to_lowercase().contains(&query)
-                                {
-                                    continue;
-                                }
-                                shown += 1;
-                                if preset.category != last_category {
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(preset.category)
-                                            .small()
-                                            .strong()
-                                            .color(theme::MUTED),
-                                    );
-                                    last_category = preset.category;
-                                }
-                                let selected = self.more_preset.as_deref() == Some(preset.name);
-                                if ui
-                                    .selectable_label(
-                                        selected,
-                                        RichText::new(preset.name).color(Color32::WHITE),
-                                    )
-                                    .clicked()
-                                {
-                                    let settings = preset.settings.clone();
-                                    self.selected_custom_preset = None;
-                                    self.more_preset = Some(preset.name.to_owned());
-                                    self.apply_settings(settings);
-                                    self.more_presets_open = false;
-                                    self.preset_search.clear();
-                                }
-                                hint(ui, &settings_summary(&preset.settings));
-                            }
-                            if shown == 0 {
-                                ui.label(
-                                    RichText::new("No presets match your search.")
-                                        .color(theme::MUTED),
-                                );
-                            }
-                        });
-                });
-            self.more_presets_open = open;
-        }
 
         if let Some((preset, custom, settings)) = chosen {
             self.preset = preset;
