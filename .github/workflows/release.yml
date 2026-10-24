@@ -14,34 +14,16 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            platform: slim-x86_64-linux
-            ext: ""
-            slim: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: slim-x86_64-windows
-            ext: ".exe"
-            slim: true
-          - os: macos-14
-            target: x86_64-apple-darwin
-            platform: slim-x86_64-macos
-            ext: ""
-            slim: true
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
             platform: x86_64-linux
             ext: ""
-            slim: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: x86_64-windows
             ext: ".exe"
-            slim: false
           - os: macos-14
             target: x86_64-apple-darwin
             platform: x86_64-macos
             ext: ""
-            slim: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,32 +32,55 @@ jobs:
           target: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage app binary
+      # One build per OS feeds both archives: the slim one ships the bare app,
+      # the full one adds FFmpeg and licenses. The binaries are identical.
+      - name: Assemble slim bundle
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="carbon-disc-v${version}-slim-${{ matrix.platform }}"
+          mkdir -p bundle
+          cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
+          cp packaging/README-slim.txt bundle/README.txt
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            mkdir -p bundle/share/applications
+            cp packaging/carbon-disc.desktop bundle/share/applications/
+            for size in 16 32 48 64 128 256; do
+              mkdir -p "bundle/share/icons/hicolor/${size}x${size}/apps"
+              cp "assets/logo-${size}.png" "bundle/share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
+            done
+          fi
+          mv bundle "$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${name}.zip" "$name"
+          else
+            tar -czf "${name}.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+
+      - name: Fetch FFmpeg (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p bundle
-          cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
-
-      - name: Fetch FFmpeg (Linux)
-        if: runner.os == 'Linux' && !matrix.slim
-        shell: bash
-        run: |
           curl -fsSLo ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
           tar -xJf ffmpeg.tar.xz
           cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg ffmpeg-master-latest-linux64-gpl/bin/ffprobe bundle/
           cp ffmpeg-master-latest-linux64-gpl/LICENSE.txt bundle/FFmpeg-LICENSE.txt
 
       - name: Fetch FFmpeg (Windows)
-        if: runner.os == 'Windows' && !matrix.slim
+        if: runner.os == 'Windows'
         shell: bash
         run: |
+          mkdir -p bundle
           curl -fsSLo ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
           7z e ffmpeg.zip -y -obundle "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe"
 
       - name: Fetch FFmpeg (macOS)
-        if: runner.os == 'macOS' && !matrix.slim
+        if: runner.os == 'macOS'
         shell: bash
         run: |
+          mkdir -p bundle
           base="https://evermeet.cx/ffmpeg"
           page=$(curl -fsSL "$base/")
           ffmpeg_zip=$(grep -oE 'href="ffmpeg-[0-9][^"]*\.zip"' <<<"$page" | head -1 | cut -d'"' -f2)
@@ -87,40 +92,30 @@ jobs:
           unzip -o "$ffprobe_zip" -d bundle/
           chmod +x bundle/ffmpeg bundle/ffprobe
 
-      - name: Assemble bundle
+      - name: Assemble full bundle
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          cd bundle
-          if [ "${{ matrix.slim }}" = "true" ]; then
-            cp ../packaging/README-slim.txt README.txt
-          else
-            cp ../packaging/README.txt ../packaging/THIRD-PARTY-NOTICES.md .
-            cp ../packaging/COPYING.GPL-2.0 COPYING.GPL-2.0
-          fi
+          name="carbon-disc-v${version}-${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/release/carbon-disc${{ matrix.ext }}" "bundle/carbon-disc${{ matrix.ext }}"
+          cp packaging/README.txt packaging/THIRD-PARTY-NOTICES.md bundle/
+          cp packaging/COPYING.GPL-2.0 bundle/COPYING.GPL-2.0
           if [ "${{ runner.os }}" = "Linux" ]; then
-            mkdir -p share/applications
-            cp ../packaging/carbon-disc.desktop share/applications/
+            mkdir -p bundle/share/applications
+            cp packaging/carbon-disc.desktop bundle/share/applications/
             for size in 16 32 48 64 128 256; do
-              mkdir -p "share/icons/hicolor/${size}x${size}/apps"
-              cp "../assets/logo-${size}.png" "share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
+              mkdir -p "bundle/share/icons/hicolor/${size}x${size}/apps"
+              cp "assets/logo-${size}.png" "bundle/share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
             done
           fi
-          if [ "${{ matrix.slim }}" != "true" ]; then
-            "./ffmpeg${{ matrix.ext }}" -version > ffmpeg-version.txt
-            cat ffmpeg-version.txt
-          fi
-          cd ..
-          ext="tar.gz"
-          mv bundle "carbon-disc-v${version}-${{ matrix.platform }}"
+          "./ffmpeg${{ matrix.ext }}" -version > bundle/ffmpeg-version.txt
+          mv bundle "$name"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            ext="zip"
-            7z a "carbon-disc-v${version}-${{ matrix.platform }}.zip" "carbon-disc-v${version}-${{ matrix.platform }}"
+            7z a "${name}.zip" "$name"
           else
-            tar -czf "carbon-disc-v${version}-${{ matrix.platform }}.tar.gz" "carbon-disc-v${version}-${{ matrix.platform }}"
+            tar -czf "${name}.tar.gz" "$name"
           fi
-          rm -rf "carbon-disc-v${version}-${{ matrix.platform }}"
-          echo "ext=$ext" >> "$GITHUB_ENV"
+          rm -rf "$name"
 
       - uses: actions/upload-artifact@v4
         with:
