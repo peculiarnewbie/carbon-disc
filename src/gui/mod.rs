@@ -1774,19 +1774,36 @@ impl App {
                                         }
                                         let selected =
                                             self.more_preset.as_deref() == Some(preset.name);
-                                        let row = ui.horizontal(|ui| {
-                                            let name = ui.selectable_label(
-                                                selected,
-                                                RichText::new(preset.name).color(Color32::WHITE),
-                                            );
-                                            let detail = ui.label(
-                                                RichText::new(settings_summary(&preset.settings))
-                                                    .small()
-                                                    .color(theme::MUTED),
-                                            );
-                                            name.union(detail)
-                                        });
-                                        if row.inner.clicked() {
+                                        // One full-width selectable row: the name
+                                        // followed by the settings summary in a
+                                        // smaller, muted style.
+                                        let mut row_text = egui::text::LayoutJob::default();
+                                        row_text.append(
+                                            preset.name,
+                                            0.0,
+                                            egui::TextFormat::simple(
+                                                egui::FontId::proportional(15.0),
+                                                Color32::WHITE,
+                                            ),
+                                        );
+                                        row_text.append(
+                                            &format!("   {}", settings_summary(&preset.settings)),
+                                            0.0,
+                                            egui::TextFormat::simple(
+                                                egui::FontId::proportional(12.0),
+                                                theme::MUTED,
+                                            ),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Button::selectable(selected, row_text)
+                                                    .min_size(egui::vec2(
+                                                        ui.available_width(),
+                                                        0.0,
+                                                    )),
+                                            )
+                                            .clicked()
+                                        {
                                             let settings = preset.settings.clone();
                                             self.selected_custom_preset = None;
                                             self.more_preset = Some(preset.name.to_owned());
