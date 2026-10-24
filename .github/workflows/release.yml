@@ -108,7 +108,7 @@ jobs:
               cp "assets/logo-${size}.png" "bundle/share/icons/hicolor/${size}x${size}/apps/carbon-disc.png"
             done
           fi
-          "./ffmpeg${{ matrix.ext }}" -version > bundle/ffmpeg-version.txt
+          "bundle/ffmpeg${{ matrix.ext }}" -version > bundle/ffmpeg-version.txt
           mv bundle "$name"
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a "${name}.zip" "$name"
