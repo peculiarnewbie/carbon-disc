@@ -25,6 +25,9 @@ pub struct Session {
     pub settings: EncodeSettings,
     pub preset: Preset,
     pub custom_preset: Option<String>,
+    /// The selected HandBrake "more" preset, if any.
+    #[serde(default)]
+    pub more_preset: Option<String>,
     pub output_dir: Option<PathBuf>,
 }
 

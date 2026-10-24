@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod crop_editor;
+mod handbrake;
 mod range_brush;
 pub mod theme;
 mod widgets;
@@ -129,6 +130,10 @@ pub struct App {
     show_save_preset: bool,
     preset_name_input: String,
     preset_description_input: String,
+    more_preset: Option<String>,
+    more_presets_open: bool,
+    preset_search: String,
+    preset_search_focus: bool,
     tab: Tab,
     confirm_close: bool,
     allow_close: bool,
@@ -161,6 +166,7 @@ impl App {
             settings: Preset::Balanced.settings(),
             preset: Preset::Balanced,
             custom_preset: None,
+            more_preset: None,
             output_dir: None,
         });
         let mut settings = session.settings;
@@ -212,6 +218,12 @@ impl App {
             show_save_preset: false,
             preset_name_input: String::new(),
             preset_description_input: String::new(),
+            more_preset: session
+                .more_preset
+                .filter(|name| handbrake::find(name).is_some()),
+            more_presets_open: false,
+            preset_search: String::new(),
+            preset_search_focus: false,
             tab: Tab::Video,
             confirm_close: false,
             allow_close: false,
@@ -404,6 +416,7 @@ impl App {
             settings,
             preset: self.preset,
             custom_preset: self.selected_custom_preset.clone(),
+            more_preset: self.more_preset.clone(),
             output_dir: self.output_dir.clone(),
         }
     }
@@ -679,14 +692,20 @@ impl App {
     }
 
     fn base_settings(&self) -> EncodeSettings {
-        self.selected_custom_preset
-            .as_ref()
-            .and_then(|name| {
-                self.custom_presets
-                    .iter()
-                    .find(|preset| &preset.name == name)
-            })
-            .map_or_else(|| self.preset.settings(), |preset| preset.settings.clone())
+        if let Some(name) = &self.selected_custom_preset
+            && let Some(preset) = self
+                .custom_presets
+                .iter()
+                .find(|preset| &preset.name == name)
+        {
+            return preset.settings.clone();
+        }
+        if let Some(name) = &self.more_preset
+            && let Some(preset) = handbrake::find(name)
+        {
+            return preset.settings.clone();
+        }
+        self.preset.settings()
     }
 
     fn preset_modified(&self) -> bool {
@@ -697,8 +716,9 @@ impl App {
 
     fn preset_label(&self) -> String {
         self.selected_custom_preset
-            .clone()
-            .unwrap_or_else(|| self.preset.name().to_owned())
+            .as_deref()
+            .or(self.more_preset.as_deref())
+            .map_or_else(|| self.preset.name().to_owned(), str::to_owned)
     }
 
     /// Keeps the container and audio codec compatible after the video encoder changes.
@@ -1681,8 +1701,9 @@ impl App {
                 .width(220.0)
                 .show_ui(ui, |ui| {
                     for preset in Preset::ALL {
-                        let selected =
-                            self.selected_custom_preset.is_none() && self.preset == preset;
+                        let selected = self.selected_custom_preset.is_none()
+                            && self.more_preset.is_none()
+                            && self.preset == preset;
                         if ui
                             .selectable_label(selected, preset.name())
                             .on_hover_text(preset.description())
@@ -1711,6 +1732,16 @@ impl App {
                                 ));
                             }
                         }
+                    }
+                    ui.separator();
+                    if ui
+                        .selectable_label(false, "More…")
+                        .on_hover_text("HandBrake's official presets, searchable")
+                        .clicked()
+                    {
+                        self.more_presets_open = true;
+                        self.preset_search_focus = true;
+                        ui.close();
                     }
                 });
             if modified {
@@ -1771,16 +1802,17 @@ impl App {
                 }
             });
         });
-        let description = self.selected_custom_preset.as_ref().map_or_else(
-            || self.preset.description().to_owned(),
-            |name| {
-                self.custom_presets
-                    .iter()
-                    .find(|preset| &preset.name == name)
-                    .map(|preset| preset.description.clone())
-                    .unwrap_or_default()
-            },
-        );
+        let description = if let Some(name) = &self.selected_custom_preset {
+            self.custom_presets
+                .iter()
+                .find(|preset| &preset.name == name)
+                .map(|preset| preset.description.clone())
+                .unwrap_or_default()
+        } else if let Some(preset) = self.more_preset.as_deref().and_then(handbrake::find) {
+            format!("HandBrake preset · {}", preset.category)
+        } else {
+            self.preset.description().to_owned()
+        };
         let summary = settings_summary(&self.settings);
         ui.label(
             RichText::new(if description.is_empty() {
@@ -1791,9 +1823,81 @@ impl App {
             .color(theme::MUTED),
         );
 
+        if self.more_presets_open {
+            let mut open = self.more_presets_open;
+            egui::Window::new("More presets")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(430.0)
+                .show(ui.ctx(), |ui| {
+                    let search = egui::TextEdit::singleline(&mut self.preset_search)
+                        .hint_text("Search presets…")
+                        .desired_width(f32::INFINITY);
+                    let response = ui.add(search);
+                    if self.preset_search_focus {
+                        response.request_focus();
+                        self.preset_search_focus = false;
+                    }
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("more_presets")
+                        .auto_shrink([false, false])
+                        .max_height(340.0)
+                        .show(ui, |ui| {
+                            let query = self.preset_search.to_lowercase();
+                            let mut shown = 0;
+                            let mut last_category = "";
+                            for preset in &handbrake::MORE_PRESETS {
+                                if !query.is_empty()
+                                    && !preset.name.to_lowercase().contains(&query)
+                                    && !preset.category.to_lowercase().contains(&query)
+                                {
+                                    continue;
+                                }
+                                shown += 1;
+                                if preset.category != last_category {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(preset.category)
+                                            .small()
+                                            .strong()
+                                            .color(theme::MUTED),
+                                    );
+                                    last_category = preset.category;
+                                }
+                                let selected = self.more_preset.as_deref() == Some(preset.name);
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(preset.name).color(Color32::WHITE),
+                                    )
+                                    .clicked()
+                                {
+                                    let settings = preset.settings.clone();
+                                    self.selected_custom_preset = None;
+                                    self.more_preset = Some(preset.name.to_owned());
+                                    self.apply_settings(settings);
+                                    self.more_presets_open = false;
+                                    self.preset_search.clear();
+                                }
+                                hint(ui, &settings_summary(&preset.settings));
+                            }
+                            if shown == 0 {
+                                ui.label(
+                                    RichText::new("No presets match your search.")
+                                        .color(theme::MUTED),
+                                );
+                            }
+                        });
+                });
+            self.more_presets_open = open;
+        }
+
         if let Some((preset, custom, settings)) = chosen {
             self.preset = preset;
             self.selected_custom_preset = custom;
+            self.more_preset = None;
             self.apply_settings(settings);
         }
         if revert {
