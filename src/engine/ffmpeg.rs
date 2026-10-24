@@ -16,8 +16,8 @@ use serde::Deserialize;
 
 use crate::{
     CropMargins, EncodeRange, EncodeRequest, EngineCapabilities, Error, MediaInfo, PreviewFrame,
-    Result, SizeMeasurement,
-    model::{AudioEncoder, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
+    Result, SizeMeasurement, SubtitleTrackSettings,
+    model::{AudioEncoder, Container, EncoderSpeed, MediaStream, StreamKind, VideoEncoder},
 };
 
 use super::{EngineEvent, MediaEngine};
@@ -103,6 +103,32 @@ impl FfmpegEngine {
 
     #[must_use]
     pub fn encode_args_for_output(request: &EncodeRequest, output: &Path) -> Vec<OsString> {
+        Self::build_args(request, output, None)
+    }
+
+    /// Text-based subtitle codecs can convert to mov_text/webvtt and burn via
+    /// libass; picture-based ones (PGS, VobSub, DVB) can only copy or overlay.
+    fn is_text_subtitle(codec: &str) -> bool {
+        matches!(
+            codec,
+            "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "mov_text" | "text"
+        )
+    }
+
+    /// Escapes a filesystem path for use inside a filtergraph argument, where
+    /// `\`, `:`, and `'` are separators.
+    fn escape_filter_path(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace(':', "\\:")
+            .replace('\'', "\\'")
+    }
+
+    fn build_args(
+        request: &EncodeRequest,
+        output: &Path,
+        burn_text_file: Option<&Path>,
+    ) -> Vec<OsString> {
         let settings = &request.settings;
         let video_codec = settings.video_encoder.ffmpeg_name();
         let preset = match (settings.video_encoder, settings.speed) {
@@ -113,12 +139,23 @@ impl FfmpegEngine {
             (_, EncoderSpeed::Balanced) => "medium",
             (_, EncoderSpeed::Quality) => "slow",
         };
+        // Burning an image track overlays it in-graph: the subtitle decoder must
+        // merge its packet fragments, and the video map comes from the filter
+        // output instead of the input.
+        let image_burn = settings.burn_subtitle
+            && request
+                .subtitle_tracks
+                .first()
+                .is_some_and(|track| !Self::is_text_subtitle(&track.codec));
         let mut args = vec!["-hide_banner".into(), "-y".into()];
         if settings.video_encoder.is_vaapi() {
             args.extend([
                 OsString::from("-vaapi_device"),
                 OsString::from("/dev/dri/renderD128"),
             ]);
+        }
+        if image_burn {
+            args.push(OsString::from("-fix_sub_duration"));
         }
         if request.range.start_secs > 0.0 {
             args.extend([
@@ -133,7 +170,9 @@ impl FfmpegEngine {
                 format!("{:.3}", request.output_duration_secs()).into(),
             ]);
         }
-        args.extend(["-map".into(), "0:v:0".into()]);
+        if !image_burn {
+            args.extend(["-map".into(), "0:v:0".into()]);
+        }
         for track in &request.audio_tracks {
             args.extend([
                 OsString::from("-map"),
@@ -238,6 +277,33 @@ impl FfmpegEngine {
                 }
             }
         }
+        // The first resolved track burns in when asked; everything else that the
+        // container can hold is muxed alongside the video.
+        let kept: Vec<&SubtitleTrackSettings> = request
+            .subtitle_tracks
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !(settings.burn_subtitle && *position == 0))
+            .filter(|(_, track)| match settings.container {
+                Container::Matroska => true,
+                Container::Mp4 | Container::WebM => Self::is_text_subtitle(&track.codec),
+            })
+            .map(|(_, track)| track)
+            .collect();
+        for track in &kept {
+            args.extend([
+                OsString::from("-map"),
+                format!("0:{}", track.source_index).into(),
+            ]);
+        }
+        for (output_index, _) in kept.iter().enumerate() {
+            let codec = match settings.container {
+                Container::Matroska => "copy",
+                Container::Mp4 => "mov_text",
+                Container::WebM => "webvtt",
+            };
+            args.extend([format!("-c:s:{output_index}").into(), OsString::from(codec)]);
+        }
         let mut filters = vec!["scale='trunc(if(gt(sar,0),iw*sar,iw)/2)*2':'ih',setsar=1".into()];
         if !settings.crop.is_zero() {
             filters.push(format!(
@@ -257,13 +323,28 @@ impl FfmpegEngine {
                 .map_or_else(|| "ih".into(), |v| v.to_string());
             filters.push(format!("scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"));
         }
+        // Burned subtitles render on the full-size picture before any hardware
+        // upload, so they follow the scaling filters and precede the VAAPI ones.
+        if let Some(path) = burn_text_file {
+            filters.push(format!("ass={}", Self::escape_filter_path(path)));
+        }
+        if image_burn {
+            filters.push("overlay=eof_action=pass".into());
+        }
         if settings.video_encoder.is_vaapi() {
             filters.push("format=nv12,hwupload".into());
         }
-        if !filters.is_empty() {
-            args.extend([OsString::from("-vf"), filters.join(",").into()]);
+        let chain = filters.join(",");
+        if image_burn {
+            args.extend([
+                OsString::from("-filter_complex"),
+                format!("[0:v]{chain}[v]").into(),
+            ]);
+            args.extend(["-map".into(), OsString::from("[v]")]);
+        } else {
+            args.extend([OsString::from("-vf"), chain.into()]);
         }
-        if request.settings.container == crate::model::Container::Mp4 {
+        if request.settings.container == Container::Mp4 {
             args.extend([OsString::from("-movflags"), OsString::from("+faststart")]);
         }
         args.extend([
@@ -381,6 +462,62 @@ impl FfmpegEngine {
         }
     }
 
+    /// Extracts the burned text track over the requested range, so its
+    /// timestamps are zero-based like the seeked video when libass burns it.
+    /// Picture tracks burn in-graph and need no extraction.
+    fn prepare_burn(&self, request: &EncodeRequest, name: &str) -> Result<Option<BurnSubtitle>> {
+        if !request.settings.burn_subtitle {
+            return Ok(None);
+        }
+        let Some(track) = request.subtitle_tracks.first() else {
+            return Ok(None);
+        };
+        if !Self::is_text_subtitle(&track.codec) {
+            return Ok(None);
+        }
+        let path = std::env::temp_dir().join(name);
+        let mut args: Vec<OsString> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-y".into(),
+        ];
+        if request.range.start_secs > 0.0 {
+            args.extend([
+                OsString::from("-ss"),
+                format!("{:.3}", request.range.start_secs).into(),
+            ]);
+        }
+        args.extend([OsString::from("-i"), request.input.as_os_str().into()]);
+        if request.range.start_secs > 0.0 || request.range.end_secs.is_some() {
+            args.extend([
+                OsString::from("-t"),
+                format!("{:.3}", request.output_duration_secs()).into(),
+            ]);
+        }
+        args.extend([
+            OsString::from("-map"),
+            format!("0:{}", track.source_index).into(),
+        ]);
+        args.push(path.clone().into_os_string());
+        let output = Command::new(&self.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| Error::Launch {
+                program: self.ffmpeg.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(Error::Process {
+                program: self.ffmpeg.display().to_string(),
+                message: tail(&String::from_utf8_lossy(&output.stderr), 5),
+            });
+        }
+        Ok(Some(BurnSubtitle { path }))
+    }
+
     /// Encodes one sample segment to `output` and reports its size and duration.
     fn run_sample(
         &self,
@@ -388,8 +525,19 @@ impl FfmpegEngine {
         output: &Path,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<(u64, f64)> {
+        let burn = self.prepare_burn(
+            request,
+            &output.file_stem().map_or_else(
+                || "carbon-disc-burn".to_owned(),
+                |stem| format!("{}.ass", stem.to_string_lossy()),
+            ),
+        )?;
         let mut child = Command::new(&self.ffmpeg)
-            .args(Self::encode_args_for_output(request, output))
+            .args(Self::build_args(
+                request,
+                output,
+                burn.as_ref().map(|burn| burn.path.as_path()),
+            ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -829,8 +977,16 @@ impl MediaEngine for FfmpegEngine {
             return Err(Error::OutputExists(request.output.clone()));
         }
         let temporary = TemporaryOutput::new(&request.output)?;
+        let burn = self.prepare_burn(
+            request,
+            &format!("carbon-disc-burn-{}.ass", std::process::id()),
+        )?;
         let mut child = Command::new(&self.ffmpeg)
-            .args(Self::encode_args_for_output(request, temporary.path()))
+            .args(Self::build_args(
+                request,
+                temporary.path(),
+                burn.as_ref().map(|burn| burn.path.as_path()),
+            ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -901,6 +1057,18 @@ impl MediaEngine for FfmpegEngine {
 struct TemporaryOutput {
     path: PathBuf,
     committed: bool,
+}
+
+/// A burned subtitle track extracted next to the temp directory, deleted when
+/// the encode that uses it finishes for any reason.
+struct BurnSubtitle {
+    path: PathBuf,
+}
+
+impl Drop for BurnSubtitle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl TemporaryOutput {
@@ -1353,6 +1521,7 @@ mod tests {
                 encoder: AudioEncoder::Aac,
                 bitrate_kbps: 192,
             }],
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
@@ -1386,6 +1555,7 @@ mod tests {
             source_height: Some(1080),
             range: crate::EncodeRange::ALL,
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings,
         };
@@ -1393,6 +1563,129 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "hevc_nvenc"]));
         assert!(args.windows(2).any(|pair| pair == ["-cq", "21"]));
         assert!(!args.iter().any(|arg| arg == "-crf"));
+    }
+
+    fn subtitle_request(
+        container: Container,
+        tracks: &[(&str, &str)],
+        settings_mask: impl FnOnce(&mut EncodeSettings),
+    ) -> EncodeRequest {
+        let mut settings = EncodeSettings {
+            container,
+            ..EncodeSettings::default()
+        };
+        settings_mask(&mut settings);
+        EncodeRequest {
+            input: "in.mkv".into(),
+            output: "out.tmp".into(),
+            source_duration_secs: 10.0,
+            source_width: Some(1920),
+            source_height: Some(1080),
+            range: crate::EncodeRange::ALL,
+            audio_tracks: Vec::new(),
+            subtitle_tracks: tracks
+                .iter()
+                .map(|(index, codec)| crate::SubtitleTrackSettings {
+                    source_index: index.parse().unwrap(),
+                    codec: (*codec).to_owned(),
+                })
+                .collect(),
+            overwrite: false,
+            settings,
+        }
+    }
+
+    fn arg_value<'a>(args: &'a [OsString], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|position| args[position + 1].to_str())
+    }
+
+    #[test]
+    fn subtitle_tracks_are_mapped_per_container() {
+        let mkv = FfmpegEngine::encode_args(&subtitle_request(
+            Container::Matroska,
+            &[("3", "subrip"), ("4", "hdmv_pgs_subtitle")],
+            |_| {},
+        ));
+        assert!(mkv.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(mkv.windows(2).any(|pair| pair == ["-map", "0:4"]));
+        assert!(mkv.windows(2).any(|pair| pair == ["-c:s:0", "copy"]));
+        assert!(mkv.windows(2).any(|pair| pair == ["-c:s:1", "copy"]));
+
+        // Text converts for MP4; picture codecs cannot be held at all.
+        let mp4 = FfmpegEngine::encode_args(&subtitle_request(
+            Container::Mp4,
+            &[("3", "subrip"), ("4", "hdmv_pgs_subtitle")],
+            |_| {},
+        ));
+        assert!(mp4.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(!mp4.iter().any(|arg| arg == "0:4"));
+        assert!(mp4.windows(2).any(|pair| pair == ["-c:s:0", "mov_text"]));
+
+        let webm = FfmpegEngine::encode_args(&subtitle_request(
+            Container::WebM,
+            &[("3", "subrip")],
+            |_| {},
+        ));
+        assert!(webm.windows(2).any(|pair| pair == ["-c:s:0", "webvtt"]));
+    }
+
+    #[test]
+    fn burning_a_text_track_extracts_it_and_skips_muxing() {
+        let request =
+            subtitle_request(Container::Matroska, &[("3", "subrip"), ("5", "ass")], |s| {
+                s.burn_subtitle = true;
+            });
+        let args = FfmpegEngine::build_args(
+            &request,
+            Path::new("out.tmp"),
+            Some(Path::new("/tmp/carbon-disc-burn-1.ass")),
+        );
+        let vf = arg_value(&args, "-vf").expect("video filter chain");
+        assert!(vf.contains("ass=/tmp/carbon-disc-burn-1.ass"));
+        // The burned track is not muxed; later tracks still are.
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:5"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:s:0", "copy"]));
+        assert!(!args.iter().any(|arg| arg == "-fix_sub_duration"));
+    }
+
+    #[test]
+    fn burning_a_picture_track_overlays_it_in_graph() {
+        let request = subtitle_request(
+            Container::Matroska,
+            &[("3", "hdmv_pgs_subtitle"), ("5", "subrip")],
+            |s| {
+                s.burn_subtitle = true;
+            },
+        );
+        let args = FfmpegEngine::encode_args(&request);
+        assert!(args.iter().any(|arg| arg == "-fix_sub_duration"));
+        let graph = arg_value(&args, "-filter_complex").expect("filter graph");
+        assert!(graph.starts_with("[0:v]"));
+        assert!(graph.contains("overlay=eof_action=pass"));
+        assert!(graph.ends_with("[v]"));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "[v]"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
+        // The burned picture track stays out of the mux; the text track remains.
+        assert!(!args.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:5"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c:s:0", "copy"]));
+        // No libass extraction happens for picture tracks.
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("ass="))
+        );
+    }
+
+    #[test]
+    fn filter_paths_are_escaped_for_filtergraphs() {
+        assert_eq!(
+            FfmpegEngine::escape_filter_path(Path::new(r"C:\Temp\sub s.ass")),
+            r"C\:\\Temp\\sub s.ass"
+        );
     }
 
     #[test]
@@ -1409,6 +1702,7 @@ mod tests {
             source_height: Some(1080),
             range: crate::EncodeRange::ALL,
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings,
         };
@@ -1435,6 +1729,7 @@ mod tests {
             source_height: Some(1080),
             range: crate::EncodeRange::new(12.5, 42.75),
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
@@ -1499,6 +1794,7 @@ mod tests {
             source_height: Some(1080),
             range: crate::EncodeRange::ALL,
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings,
         };
@@ -1606,6 +1902,7 @@ mod tests {
                     bitrate_kbps: 0,
                 },
             ],
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };

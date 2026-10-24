@@ -5,10 +5,11 @@ FFmpeg. It aims for HandBrake's approachable workflow while keeping the media ba
 behind a small, testable Rust interface.
 
 > Early development: probing, frame previews, start/end range cutting, audio-track
-> selection, crop and resolution controls, pre-encode size estimates, safe output
+> selection, subtitle selection by language or track with burn-in, crop and
+> resolution controls, frame rate targets, pre-encode size estimates, safe output
 > replacement, hardware encoder discovery, custom presets, recursive batch import,
 > persistent queues, progress, cancellation, and FFmpeg transcoding are implemented.
-> Subtitles and filters are planned next.
+> Filters are planned next.
 
 ## Screenshots
 

@@ -9,14 +9,14 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::{
     AudioTrackSettings, CropMargins, CustomPreset, EncodeRange, EncodeRequest, EncodeSettings,
-    SizeDerivation, SizeMeasurement,
+    SizeDerivation, SizeMeasurement, SubtitleSelection,
     engine::ffmpeg::FfmpegEngine,
     model::{
         AudioEncoder, Container, EncoderSpeed, EngineCapabilities, MediaInfo, Preset, VideoEncoder,
     },
     persistence::Session,
     queue::{Command, Coordinator, Event, JobId, JobSnapshot, JobState},
-    size_derivation,
+    resolve_subtitles, size_derivation,
 };
 
 mod crop_editor;
@@ -38,6 +38,11 @@ const RESOLUTION_LIMITS: [(&str, u32, u32); 5] = [
 ];
 const AUDIO_BITRATES: [u16; 9] = [64, 96, 128, 160, 192, 256, 320, 384, 512];
 const FRAME_RATE_CHOICES: [u32; 6] = [24, 25, 30, 48, 50, 60];
+/// Fallback pool for the language picker when no file is open to read tags from.
+const COMMON_LANGUAGES: [&str; 16] = [
+    "eng", "fra", "spa", "deu", "ita", "jpn", "kor", "zho", "rus", "por", "hin", "ara", "tur",
+    "pol", "nld", "swe",
+];
 const ESTIMATE_DEBOUNCE: Duration = Duration::from_millis(1500);
 const PRIMARY_BUTTON_SIZE: egui::Vec2 = egui::vec2(150.0, 34.0);
 
@@ -45,6 +50,7 @@ const PRIMARY_BUTTON_SIZE: egui::Vec2 = egui::vec2(150.0, 34.0);
 enum Tab {
     Video,
     Audio,
+    Subtitles,
     Picture,
 }
 
@@ -108,6 +114,9 @@ pub struct App {
     estimate_due: Option<Instant>,
     next_estimate_id: u64,
     selected_audio_tracks: BTreeSet<u32>,
+    selected_subtitle_tracks: BTreeSet<u32>,
+    available_language_pick: Option<String>,
+    selected_language_pick: Option<String>,
     pending_add: Option<PendingAdd>,
     status: Option<Status>,
     jobs: Vec<JobSnapshot>,
@@ -188,6 +197,9 @@ impl App {
             estimate_due: None,
             next_estimate_id: 1,
             selected_audio_tracks: BTreeSet::new(),
+            selected_subtitle_tracks: BTreeSet::new(),
+            available_language_pick: None,
+            selected_language_pick: None,
             pending_add: None,
             status,
             jobs: Vec::new(),
@@ -232,6 +244,9 @@ impl App {
                             if let Some(first_audio) = media.audio_streams().next() {
                                 self.selected_audio_tracks.insert(first_audio.index);
                             }
+                            self.selected_subtitle_tracks.clear();
+                            self.available_language_pick = None;
+                            self.selected_language_pick = None;
                             self.trim_start_secs = 0.0;
                             self.trim_end_secs = media.duration_secs;
                             self.preview_at_secs = 0.0;
@@ -532,6 +547,16 @@ impl App {
                     bitrate_kbps: self.settings.audio_bitrate_kbps,
                 })
                 .collect(),
+            subtitle_tracks: resolve_subtitles(
+                &media.streams,
+                self.settings.subtitle_selection,
+                &self.settings.subtitle_languages,
+                &self
+                    .selected_subtitle_tracks
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
             overwrite: false,
             settings: self.settings.clone(),
         })
@@ -1602,9 +1627,15 @@ impl App {
             ),
             _ => "Audio".into(),
         };
+        let subtitle_label = if self.settings.subtitle_selection == SubtitleSelection::Manual {
+            format!("Subtitles  {}", self.selected_subtitle_tracks.len())
+        } else {
+            "Subtitles".to_owned()
+        };
         let tabs = [
             (Tab::Video, "Video".to_owned()),
             (Tab::Audio, audio_label),
+            (Tab::Subtitles, subtitle_label),
             (Tab::Picture, "Size & crop".to_owned()),
         ];
         egui::Frame::new()
@@ -1624,6 +1655,7 @@ impl App {
                 match self.tab {
                     Tab::Video => self.video_ui(ui),
                     Tab::Audio => self.audio_ui(ui),
+                    Tab::Subtitles => self.subtitle_ui(ui),
                     Tab::Picture => self.picture_ui(ui),
                 }
             });
@@ -2044,6 +2076,206 @@ impl App {
                         }
                     });
             });
+        });
+    }
+
+    fn subtitle_ui(&mut self, ui: &mut egui::Ui) {
+        field_row(ui, "Selection", |ui| {
+            egui::ComboBox::from_id_salt("subtitle_selection")
+                .selected_text(self.settings.subtitle_selection.display_name())
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for selection in SubtitleSelection::ALL {
+                        ui.selectable_value(
+                            &mut self.settings.subtitle_selection,
+                            selection,
+                            selection.display_name(),
+                        );
+                    }
+                });
+            hint(
+                ui,
+                match self.settings.subtitle_selection {
+                    SubtitleSelection::None => "The output will have no subtitle tracks",
+                    SubtitleSelection::Manual => {
+                        "Pick tracks below. Queued files pick the same stream numbers when they have them."
+                    }
+                    SubtitleSelection::FirstMatching => {
+                        "Adds the first track in any of the selected languages"
+                    }
+                    SubtitleSelection::AllMatching => "Adds every track in the selected languages",
+                },
+            );
+        });
+        if matches!(
+            self.settings.subtitle_selection,
+            SubtitleSelection::FirstMatching | SubtitleSelection::AllMatching
+        ) {
+            field_row(ui, "Languages", |ui| {
+                let mut pool: Vec<String> = self
+                    .media
+                    .as_ref()
+                    .map(|media| {
+                        let mut codes: Vec<String> = media
+                            .subtitle_streams()
+                            .filter_map(|stream| stream.language.clone())
+                            .collect();
+                        codes.sort();
+                        codes.dedup();
+                        codes
+                    })
+                    .unwrap_or_default();
+                if pool.is_empty() {
+                    pool = COMMON_LANGUAGES
+                        .iter()
+                        .map(|code| (*code).to_owned())
+                        .collect();
+                }
+                let available: Vec<String> = pool
+                    .into_iter()
+                    .filter(|code| !self.settings.subtitle_languages.contains(code))
+                    .collect();
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Available").color(theme::MUTED));
+                    egui::ScrollArea::vertical()
+                        .max_height(108.0)
+                        .show(ui, |ui| {
+                            if available.is_empty() {
+                                ui.label(RichText::new("All added").color(theme::MUTED));
+                            }
+                            for code in &available {
+                                if ui
+                                    .selectable_label(
+                                        self.available_language_pick.as_deref() == Some(code),
+                                        language_name(Some(code)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.available_language_pick = Some(code.clone());
+                                }
+                            }
+                        });
+                });
+                ui.vertical(|ui| {
+                    ui.add_space(ui.spacing().interact_size.y);
+                    ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
+                        if ui.button("Add").clicked()
+                            && let Some(code) = self.available_language_pick.take()
+                        {
+                            self.settings.subtitle_languages.push(code);
+                            self.selected_language_pick = None;
+                        }
+                    });
+                    ui.add_enabled_ui(self.selected_language_pick.is_some(), |ui| {
+                        if ui.button("Remove").clicked()
+                            && let Some(code) = self.selected_language_pick.take()
+                        {
+                            self.settings
+                                .subtitle_languages
+                                .retain(|kept| kept != &code);
+                            self.available_language_pick = None;
+                        }
+                    });
+                });
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Selected").color(theme::MUTED));
+                    egui::ScrollArea::vertical()
+                        .max_height(108.0)
+                        .show(ui, |ui| {
+                            if self.settings.subtitle_languages.is_empty() {
+                                ui.label(RichText::new("None").color(theme::MUTED));
+                            }
+                            for code in &self.settings.subtitle_languages {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_language_pick.as_deref() == Some(code),
+                                        language_name(Some(code)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_language_pick = Some(code.clone());
+                                }
+                            }
+                        });
+                });
+                hint(
+                    ui,
+                    "Queued files resolve their own tracks from these languages.",
+                );
+            });
+        }
+        if self.settings.subtitle_selection == SubtitleSelection::Manual {
+            let tracks: Vec<_> = self
+                .media
+                .as_ref()
+                .map(|media| media.subtitle_streams().cloned().collect())
+                .unwrap_or_default();
+            field_row(ui, "Tracks", |ui| {
+                if self.media.is_none() {
+                    ui.label(
+                        RichText::new(
+                            "Open a video to pick its subtitle tracks. Queued files pick the same stream numbers when they have them.",
+                        )
+                        .color(theme::MUTED),
+                    );
+                    return;
+                }
+                if tracks.is_empty() {
+                    ui.label(
+                        RichText::new("This video has no subtitle tracks.").color(theme::MUTED),
+                    );
+                    return;
+                }
+                let burned_index = self
+                    .settings
+                    .burn_subtitle
+                    .then(|| self.selected_subtitle_tracks.iter().next().copied())
+                    .flatten();
+                for (number, track) in tracks.iter().enumerate() {
+                    let mut selected = self.selected_subtitle_tracks.contains(&track.index);
+                    let mut label = format!(
+                        "{}.  {}",
+                        number + 1,
+                        language_name(track.language.as_deref())
+                    );
+                    if let Some(title) = &track.title {
+                        label.push_str(&format!(" — {title}"));
+                    }
+                    if burned_index == Some(track.index) {
+                        label.push_str("  ·  burned in");
+                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut selected, RichText::new(label).color(Color32::WHITE));
+                        ui.label(RichText::new(track.codec.to_uppercase()).color(theme::MUTED));
+                    });
+                    if selected {
+                        self.selected_subtitle_tracks.insert(track.index);
+                    } else {
+                        self.selected_subtitle_tracks.remove(&track.index);
+                    }
+                }
+                if self.selected_subtitle_tracks.is_empty() {
+                    ui.label(
+                        RichText::new("No tracks selected: the output will have no subtitles.")
+                            .color(theme::MUTED),
+                    );
+                }
+            });
+        }
+        field_row(ui, "Burn-in", |ui| {
+            ui.add_enabled_ui(
+                self.settings.subtitle_selection != SubtitleSelection::None,
+                |ui| {
+                    ui.checkbox(
+                        &mut self.settings.burn_subtitle,
+                        "Burn the first selected track into the picture",
+                    );
+                },
+            );
+            hint(
+                ui,
+                "Renders subtitles onto the video itself: always visible and needs no player support. Picture tracks (PGS, VobSub) can only burn in — MP4 and WebM cannot hold them as tracks.",
+            );
         });
     }
 
@@ -2891,6 +3123,15 @@ fn settings_summary(settings: &EncodeSettings) -> String {
     }
     if let Some(fps) = settings.frame_rate {
         parts.push(format!("{fps} fps"));
+    }
+    match settings.subtitle_selection {
+        SubtitleSelection::None => {}
+        SubtitleSelection::Manual => parts.push("subs: manual".to_owned()),
+        SubtitleSelection::FirstMatching => parts.push("subs: first match".to_owned()),
+        SubtitleSelection::AllMatching => parts.push("subs: all matches".to_owned()),
+    }
+    if settings.burn_subtitle && settings.subtitle_selection != SubtitleSelection::None {
+        parts.push("burned-in".to_owned());
     }
     parts.push(match settings.audio_encoder {
         AudioEncoder::Copy => "audio passthrough".to_owned(),

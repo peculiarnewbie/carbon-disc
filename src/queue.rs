@@ -12,6 +12,7 @@ use std::{
 use crate::{
     AudioTrackSettings, EncodeRange, EncodeRequest, EncodeSettings, EngineCapabilities,
     MediaEngine, MediaInfo, PreviewFrame, SizeMeasurement, engine::EngineEvent,
+    model::resolve_subtitles,
 };
 
 pub type JobId = u64;
@@ -454,6 +455,12 @@ fn import_paths(
                     source_height: media.video_stream().and_then(|stream| stream.height),
                     range: EncodeRange::ALL,
                     audio_tracks,
+                    subtitle_tracks: resolve_subtitles(
+                        &media.streams,
+                        settings.subtitle_selection,
+                        &settings.subtitle_languages,
+                        &[],
+                    ),
                     overwrite: false,
                     settings: settings.clone(),
                 };

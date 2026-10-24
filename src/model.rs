@@ -89,7 +89,9 @@ pub fn size_derivation(measured: &EncodeRequest, next: &EncodeRequest) -> SizeDe
         || was.container != now.container
         || was.max_width != now.max_width
         || was.max_height != now.max_height
-        || was.crop != now.crop;
+        || was.crop != now.crop
+        // Muxed subtitles do not touch the video, but burned-in ones do.
+        || was.burn_subtitle != now.burn_subtitle;
     if different_encode {
         return SizeDerivation::Invalid;
     }
@@ -137,6 +139,12 @@ impl MediaInfo {
         self.streams
             .iter()
             .filter(|stream| stream.kind == StreamKind::Audio)
+    }
+
+    pub fn subtitle_streams(&self) -> impl Iterator<Item = &MediaStream> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.kind == StreamKind::Subtitle)
     }
 }
 
@@ -192,6 +200,8 @@ pub struct EncodeRequest {
     pub source_height: Option<u32>,
     pub range: EncodeRange,
     pub audio_tracks: Vec<AudioTrackSettings>,
+    #[serde(default)]
+    pub subtitle_tracks: Vec<SubtitleTrackSettings>,
     pub overwrite: bool,
     pub settings: EncodeSettings,
 }
@@ -246,6 +256,15 @@ impl EncodeRequest {
                 "frame rate must be greater than zero".into(),
             ));
         }
+        let mut subtitle_indices = std::collections::HashSet::new();
+        for track in &self.subtitle_tracks {
+            if !subtitle_indices.insert(track.source_index) {
+                return Err(crate::Error::InvalidRequest(format!(
+                    "subtitle stream {} was selected more than once",
+                    track.source_index
+                )));
+            }
+        }
         let mut indices = std::collections::HashSet::new();
         for track in &self.audio_tracks {
             if !indices.insert(track.source_index) {
@@ -294,6 +313,108 @@ pub struct AudioTrackSettings {
     pub source_index: u32,
     pub encoder: AudioEncoder,
     pub bitrate_kbps: u16,
+}
+
+/// A subtitle stream resolved for the output. The source's codec name decides
+/// how the track is stored: copied into Matroska as-is, converted to text for
+/// MP4/WebM, dropped for picture codecs they cannot hold, or burned in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubtitleTrackSettings {
+    pub source_index: u32,
+    pub codec: String,
+}
+
+/// How subtitle tracks are picked when a request is built. Resolution happens
+/// against the probed stream list, so queued files resolve their own tracks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubtitleSelection {
+    /// The output carries no subtitle tracks.
+    #[default]
+    None,
+    /// The user picked specific streams.
+    Manual,
+    /// The first track in any of the selected languages, in source order.
+    FirstMatching,
+    /// Every track in any of the selected languages, in source order.
+    AllMatching,
+}
+
+impl SubtitleSelection {
+    pub const ALL: [Self; 4] = [
+        Self::None,
+        Self::Manual,
+        Self::FirstMatching,
+        Self::AllMatching,
+    ];
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::None => "No subtitles",
+            Self::Manual => "Manually selected tracks",
+            Self::FirstMatching => "First matching selected languages",
+            Self::AllMatching => "All matching selected languages",
+        }
+    }
+}
+
+/// Picks the subtitle streams for an encode. Language matching is
+/// case-insensitive over ISO 639-2 codes and treats the common B/T aliases
+/// (`fre`/`fra`, `ger`/`deu`, `chi`/`zho`) as the same language. Streams with
+/// no language tag never match a language selection.
+#[must_use]
+pub fn resolve_subtitles(
+    streams: &[MediaStream],
+    selection: SubtitleSelection,
+    languages: &[String],
+    manual: &[u32],
+) -> Vec<SubtitleTrackSettings> {
+    let track = |stream: &MediaStream| SubtitleTrackSettings {
+        source_index: stream.index,
+        codec: stream.codec.clone(),
+    };
+    let mut candidates = streams
+        .iter()
+        .filter(|stream| stream.kind == StreamKind::Subtitle);
+    match selection {
+        SubtitleSelection::None => Vec::new(),
+        SubtitleSelection::Manual => candidates
+            .filter(|stream| manual.contains(&stream.index))
+            .map(track)
+            .collect(),
+        SubtitleSelection::FirstMatching => candidates
+            .find(|stream| language_matches(stream, languages))
+            .map(track)
+            .into_iter()
+            .collect(),
+        SubtitleSelection::AllMatching => candidates
+            .filter(|stream| language_matches(stream, languages))
+            .map(track)
+            .collect(),
+    }
+}
+
+fn language_matches(stream: &MediaStream, languages: &[String]) -> bool {
+    stream
+        .language
+        .as_deref()
+        .map(|code| {
+            languages
+                .iter()
+                .any(|picked| normalize_language(code) == normalize_language(picked))
+        })
+        .unwrap_or(false)
+}
+
+/// Maps ISO 639-2/B and -/T codes onto the same key so `fre` matches `fra`.
+fn normalize_language(code: &str) -> String {
+    let lower = code.to_ascii_lowercase();
+    match lower.as_str() {
+        "fre" => "fra".into(),
+        "ger" => "deu".into(),
+        "chi" => "zho".into(),
+        other => other.to_owned(),
+    }
 }
 
 /// A half-open time range in the source. `end_secs: None` means the end of the source.
@@ -365,6 +486,16 @@ pub struct EncodeSettings {
     pub frame_rate: Option<u32>,
     pub audio_encoder: AudioEncoder,
     pub audio_bitrate_kbps: u16,
+    #[serde(default)]
+    pub subtitle_selection: SubtitleSelection,
+    /// ISO 639-2 language codes for the language-based selections, in the
+    /// order the user arranged them.
+    #[serde(default)]
+    pub subtitle_languages: Vec<String>,
+    /// Burns the first selected subtitle track into the picture instead of
+    /// muxing it. Only one track can burn in.
+    #[serde(default)]
+    pub burn_subtitle: bool,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub crop: CropMargins,
@@ -654,6 +785,9 @@ impl Preset {
                 quality: 24,
                 speed: EncoderSpeed::Fast,
                 frame_rate: None,
+                subtitle_selection: SubtitleSelection::None,
+                subtitle_languages: Vec::new(),
+                burn_subtitle: false,
                 audio_encoder: AudioEncoder::Aac,
                 audio_bitrate_kbps: 160,
                 max_width: Some(1920),
@@ -666,6 +800,9 @@ impl Preset {
                 quality: 21,
                 speed: EncoderSpeed::Balanced,
                 frame_rate: None,
+                subtitle_selection: SubtitleSelection::None,
+                subtitle_languages: Vec::new(),
+                burn_subtitle: false,
                 audio_encoder: AudioEncoder::Aac,
                 audio_bitrate_kbps: 192,
                 max_width: None,
@@ -678,6 +815,9 @@ impl Preset {
                 quality: 18,
                 speed: EncoderSpeed::Quality,
                 frame_rate: None,
+                subtitle_selection: SubtitleSelection::None,
+                subtitle_languages: Vec::new(),
+                burn_subtitle: false,
                 audio_encoder: AudioEncoder::Opus,
                 audio_bitrate_kbps: 192,
                 max_width: None,
@@ -690,6 +830,9 @@ impl Preset {
                 quality: 30,
                 speed: EncoderSpeed::Quality,
                 frame_rate: None,
+                subtitle_selection: SubtitleSelection::None,
+                subtitle_languages: Vec::new(),
+                burn_subtitle: false,
                 audio_encoder: AudioEncoder::Opus,
                 audio_bitrate_kbps: 128,
                 max_width: None,
@@ -717,6 +860,7 @@ mod tests {
                 encoder: AudioEncoder::Aac,
                 bitrate_kbps: 128,
             }],
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings {
                 quality,
@@ -835,6 +979,86 @@ mod tests {
         assert_eq!(stream.frame_rate_display(), None);
     }
 
+    fn subtitle_stream(index: u32, codec: &str, language: Option<&str>) -> MediaStream {
+        MediaStream {
+            index,
+            kind: StreamKind::Subtitle,
+            codec: codec.into(),
+            width: None,
+            height: None,
+            frame_rate: None,
+            channels: None,
+            language: language.map(str::to_owned),
+            title: None,
+        }
+    }
+
+    #[test]
+    fn subtitle_resolution_picks_streams_per_behavior() {
+        let streams = vec![
+            subtitle_stream(3, "subrip", Some("eng")),
+            subtitle_stream(4, "hdmv_pgs_subtitle", Some("fre")),
+            subtitle_stream(5, "ass", Some("ger")),
+            subtitle_stream(6, "subrip", None),
+        ];
+        let manual = [4];
+        let languages = vec!["fre".to_owned(), "DEU".to_owned()];
+
+        assert!(
+            resolve_subtitles(&streams, SubtitleSelection::None, &languages, &manual).is_empty()
+        );
+        // Manual picks by stream index regardless of language.
+        assert_eq!(
+            resolve_subtitles(&streams, SubtitleSelection::Manual, &languages, &manual)[0]
+                .source_index,
+            4
+        );
+        // First match wins in source order; B/T aliases count as one language.
+        assert_eq!(
+            resolve_subtitles(
+                &streams,
+                SubtitleSelection::FirstMatching,
+                &languages,
+                &manual
+            )[0]
+            .source_index,
+            4
+        );
+        // All matches come back in source order; untagged streams never match.
+        let all = resolve_subtitles(
+            &streams,
+            SubtitleSelection::AllMatching,
+            &languages,
+            &manual,
+        );
+        assert_eq!(
+            all.iter().map(|t| t.source_index).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        // An empty language selection matches nothing.
+        assert!(
+            resolve_subtitles(&streams, SubtitleSelection::AllMatching, &[], &manual).is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_subtitle_tracks() {
+        let mut request = estimate_fixture("source.mkv", 21);
+        request.subtitle_tracks = vec![
+            SubtitleTrackSettings {
+                source_index: 3,
+                codec: "subrip".into(),
+            },
+            SubtitleTrackSettings {
+                source_index: 3,
+                codec: "subrip".into(),
+            },
+        ];
+        assert!(request.validate().is_err());
+        request.subtitle_tracks.truncate(1);
+        assert!(request.validate().is_ok());
+    }
+
     #[test]
     fn reencoded_audio_size_is_exact_and_skips_passthrough() {
         let request = EncodeRequest {
@@ -856,6 +1080,7 @@ mod tests {
                     bitrate_kbps: 0,
                 },
             ],
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
@@ -873,6 +1098,7 @@ mod tests {
             source_height: Some(1080),
             range: EncodeRange::new(30.0, 20.0),
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
@@ -889,6 +1115,7 @@ mod tests {
             source_height: Some(1080),
             range: EncodeRange::ALL,
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
@@ -906,6 +1133,7 @@ mod tests {
             source_height: Some(1080),
             range: EncodeRange::ALL,
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             overwrite: false,
             settings: EncodeSettings::default(),
         };
