@@ -2135,68 +2135,91 @@ impl App {
                     .into_iter()
                     .filter(|code| !self.settings.subtitle_languages.contains(code))
                     .collect();
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Available").color(theme::MUTED));
-                    egui::ScrollArea::vertical()
-                        .max_height(108.0)
-                        .show(ui, |ui| {
-                            if available.is_empty() {
-                                ui.label(RichText::new("All added").color(theme::MUTED));
-                            }
-                            for code in &available {
-                                if ui
-                                    .selectable_label(
-                                        self.available_language_pick.as_deref() == Some(code),
-                                        language_name(Some(code)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.available_language_pick = Some(code.clone());
-                                }
-                            }
-                        });
-                });
-                ui.vertical(|ui| {
-                    ui.add_space(ui.spacing().interact_size.y);
-                    ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
-                        if ui.button("Add").clicked()
-                            && let Some(code) = self.available_language_pick.take()
-                        {
-                            self.settings.subtitle_languages.push(code);
-                            self.selected_language_pick = None;
-                        }
-                    });
-                    ui.add_enabled_ui(self.selected_language_pick.is_some(), |ui| {
-                        if ui.button("Remove").clicked()
-                            && let Some(code) = self.selected_language_pick.take()
-                        {
-                            self.settings
-                                .subtitle_languages
-                                .retain(|kept| kept != &code);
-                            self.available_language_pick = None;
-                        }
-                    });
-                });
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Selected").color(theme::MUTED));
-                    egui::ScrollArea::vertical()
-                        .max_height(108.0)
-                        .show(ui, |ui| {
-                            if self.settings.subtitle_languages.is_empty() {
-                                ui.label(RichText::new("None").color(theme::MUTED));
-                            }
-                            for code in &self.settings.subtitle_languages {
-                                if ui
-                                    .selectable_label(
-                                        self.selected_language_pick.as_deref() == Some(code),
-                                        language_name(Some(code)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.selected_language_pick = Some(code.clone());
-                                }
+                // HandBrake-style columns: the two lists side by side with the
+                // Add/Remove buttons between them.
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(170.0, 130.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.label(RichText::new("Available").color(theme::MUTED));
+                            sunken_frame(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("available_languages")
+                                    .max_height(106.0)
+                                    .show(ui, |ui| {
+                                        if available.is_empty() {
+                                            ui.label(
+                                                RichText::new("All added").color(theme::MUTED),
+                                            );
+                                        }
+                                        for code in &available {
+                                            if ui
+                                                .selectable_label(
+                                                    self.available_language_pick.as_deref()
+                                                        == Some(code),
+                                                    language_name(Some(code)),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.available_language_pick = Some(code.clone());
+                                            }
+                                        }
+                                    });
+                            });
+                        },
+                    );
+                    ui.allocate_ui(egui::vec2(74.0, 130.0), |ui| {
+                        ui.add_space(ui.spacing().interact_size.y + 6.0);
+                        ui.add_enabled_ui(self.available_language_pick.is_some(), |ui| {
+                            if ui.button("Add").clicked()
+                                && let Some(code) = self.available_language_pick.take()
+                            {
+                                self.settings.subtitle_languages.push(code);
+                                self.selected_language_pick = None;
                             }
                         });
+                        ui.add_space(6.0);
+                        ui.add_enabled_ui(self.selected_language_pick.is_some(), |ui| {
+                            if ui.button("Remove").clicked()
+                                && let Some(code) = self.selected_language_pick.take()
+                            {
+                                self.settings
+                                    .subtitle_languages
+                                    .retain(|kept| kept != &code);
+                                self.available_language_pick = None;
+                            }
+                        });
+                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(170.0, 130.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.label(RichText::new("Selected").color(theme::MUTED));
+                            sunken_frame(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("selected_languages")
+                                    .max_height(106.0)
+                                    .show(ui, |ui| {
+                                        if self.settings.subtitle_languages.is_empty() {
+                                            ui.label(RichText::new("None").color(theme::MUTED));
+                                        }
+                                        for code in &self.settings.subtitle_languages {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_language_pick.as_deref()
+                                                        == Some(code),
+                                                    language_name(Some(code)),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_language_pick = Some(code.clone());
+                                            }
+                                        }
+                                    });
+                            });
+                        },
+                    );
                 });
                 hint(
                     ui,
@@ -3017,6 +3040,16 @@ fn field_row(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui
         ui.vertical(add_contents);
     });
     ui.add_space(10.0);
+}
+
+/// A recessed panel behind scrollable lists, so they read as scrollable.
+fn sunken_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(theme::SUNKEN)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, add_contents);
 }
 
 fn hint(ui: &mut egui::Ui, text: &str) {

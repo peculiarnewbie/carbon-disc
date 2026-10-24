@@ -5,6 +5,8 @@ pub const VIOLET_LIGHT: Color32 = Color32::from_rgb(167, 139, 250);
 pub const GREEN: Color32 = Color32::from_rgb(34, 197, 94);
 pub const RED: Color32 = Color32::from_rgb(239, 68, 68);
 pub const PANEL: Color32 = Color32::from_rgb(18, 20, 28);
+/// Slightly darker than the panel, for inset scroll lists.
+pub const SUNKEN: Color32 = Color32::from_rgb(13, 15, 22);
 pub const WINDOW: Color32 = Color32::from_rgb(26, 29, 38);
 pub const BORDER: Color32 = Color32::from_rgb(38, 43, 56);
 pub const MUTED: Color32 = Color32::from_rgb(148, 163, 184);
