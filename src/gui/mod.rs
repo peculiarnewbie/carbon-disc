@@ -1751,7 +1751,11 @@ impl App {
                                 .auto_shrink([false, false])
                                 .max_height(380.0)
                                 .show(ui, |ui| {
+                                    // Rows sit flush, with the padding living
+                                    // inside each button so the whole column
+                                    // stays hoverable.
                                     ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
                                     let query = self.preset_search.to_lowercase();
                                     let mut shown = 0;
                                     let mut last_category = "";
